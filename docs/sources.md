@@ -257,3 +257,14 @@ sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm install airflow apache-airflow/ai
 ```
 sudo kubectl describe pod airflow-redis-0 -n airflow | grep -A 10 Events
 ```
+
+```
+sudo kubectl create secret generic airflow-git-credentials \
+  -n airflow \
+  --from-literal=GIT_SYNC_USERNAME='chiglo-k' \
+  --from-literal=GIT_SYNC_PASSWORD='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'
+
+
+  ```
+  sudo kubectl get svc -n airflow
+  ```
