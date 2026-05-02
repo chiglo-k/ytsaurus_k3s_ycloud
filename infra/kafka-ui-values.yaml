@@ -1,0 +1,10 @@
+yamlApplicationConfig:
+  kafka:
+    clusters:
+      - name: k3s-kafka
+        bootstrapServers: kafka.kafka.svc.cluster.local:9092
+
+service:
+  type: NodePort
+  port: 80
+  nodePort: 30808

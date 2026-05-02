@@ -1,0 +1,34 @@
+executor: CeleryExecutor
+
+webserver:
+  service:
+    type: NodePort
+    nodePort: 30081
+
+scheduler:
+  replicas: 1
+
+workers:
+  replicas: 1
+
+triggerer:
+  enabled: true
+  replicas: 1
+
+postgresql:
+  enabled: true
+  auth:
+    username: airflow
+    password: airflow
+    database: airflow
+
+redis:
+  enabled: true
+
+dags:
+  persistence:
+    enabled: false
+
+logs:
+  persistence:
+    enabled: false

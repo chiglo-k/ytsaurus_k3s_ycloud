@@ -1,0 +1,37 @@
+kraft:
+  enabled: true
+
+controller:
+  replicaCount: 1
+  persistence:
+    enabled: true
+    size: 8Gi
+
+broker:
+  replicaCount: 1
+  persistence:
+    enabled: true
+    size: 8Gi
+
+listeners:
+  client:
+    protocol: PLAINTEXT
+  controller:
+    protocol: PLAINTEXT
+  interbroker:
+    protocol: PLAINTEXT
+  external:
+    protocol: PLAINTEXT
+
+externalAccess:
+  enabled: false
+
+service:
+  type: ClusterIP
+
+auth:
+  enabled: false
+
+metrics:
+  kafka:
+    enabled: false
