@@ -1,14 +1,4 @@
-#!/bin/bash
-# create_silver_tables.sh
-# DDL для silver-слоя greenhub:
-#
-# Запуск: ~/git/repo/spyt/create_silver_tables.sh
-#
-# После запуска SPYT-job bronze_to_silver_greenhub.py:
-#   - читает schema этой таблицы
-#   - делает truncate (remove + create со schema)
-#   - пишет результат join'а
-# Это гарантирует что схема из DDL, не от Spark inference.
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -17,18 +7,20 @@ SILVER_TABLE="${SILVER_ROOT}/greenhub_telemetry"
 
 yt create map_node "${SILVER_ROOT}" --recursive --ignore-existing
 
-# Если таблица уже есть — пересоздаём (DDL может эволюционировать)
 if yt exists "${SILVER_TABLE}"; then
-    echo "[INFO] Removing existing ${SILVER_TABLE} (will recreate with fresh DDL)"
-    yt remove "${SILVER_TABLE}"
+    echo "[INFO] Removing existing ${SILVER_TABLE}"
+    yt remove --force "${SILVER_TABLE}"
 fi
 
 yt create table "${SILVER_TABLE}" --attributes '{
   schema=[
-    {name=fact_uid;                 type=string;    required=%true};
-    {name=source_id;                type=int64;     required=%true};
-    {name=device_id;                type=int64;     required=%true};
-    {name=timestamp;                type=timestamp; required=%true};
+    {name=fact_uid;                 type=string;  required=%true};
+    {name=source_id;                type=int64;   required=%true};
+    {name=device_id;                type=int64};
+    {name=device_uid;               type=string;  required=%true};
+
+    {name=event_ts_str;             type=string;  required=%true};
+    {name=event_date;               type=string;  required=%true};
 
     {name=country_code;             type=string};
     {name=timezone_name;            type=string};
@@ -68,7 +60,7 @@ yt create table "${SILVER_TABLE}" --attributes '{
     {name=nfc_enabled;              type=boolean};
     {name=developer_mode;           type=boolean};
 
-    {name=date_local;               type=date};
+    {name=date_local;               type=string};
     {name=hour_of_day;              type=int64};
     {name=day_of_week;              type=int64};
     {name=is_night;                 type=boolean};
@@ -78,9 +70,11 @@ yt create table "${SILVER_TABLE}" --attributes '{
     {name=memory_used_pct;          type=double};
     {name=storage_used_pct;         type=double};
 
-    {name=_silver_batch_id;         type=string;    required=%true};
-    {name=_silver_built_at;         type=timestamp; required=%true};
-    {name=_bronze_loaded_at;        type=timestamp};
+    {name=_source_file;             type=string};
+    {name=_file_hash;               type=string};
+    {name=_bronze_loaded_at;        type=string};
+    {name=_silver_batch_id;         type=string;  required=%true};
+    {name=_silver_built_at;         type=string;  required=%true};
   ];
 }'
 

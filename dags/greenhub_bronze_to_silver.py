@@ -1,22 +1,15 @@
+#!/usr/bin/env python3
 """
 greenhub_bronze_to_silver.py
 
-DAG-2 of 3: bronze fact 12 dim -> silver wide table.
+DAG-2: YTsaurus bronze fact + dim -> silver wide table.
 
-Триггерится после успешного завершения greenhub_s3_to_bronze
+Триггер:
+  вручную или по расписанию.
 
 Логика:
-  Один task -> SPYT job через SSH -> vm1 -> spark-submit-yt
-  Job делает overwrite //home/silver_stage/greenhub_telemetry
-  State: events лог в S3 (lineage / runs history)
-
-VARIABLES:
-    GREENHUB_SSH_CONN_ID  vm1_ssh
-    GREENHUB_AWS_CONN_ID  seaweedfs_s3
-    GREENHUB_BRONZE_SILVER_LAUNCHER /home/chig_k3s/main_d/spyt/launch_bronze_to_silver.sh
-    GREENHUB_SILVER_STATE_KEY  _state/greenhub_silver_runs.json
-    GREENHUB_S3_BUCKET greenhub
-    YT_PROXY  http://localhost:31103
+  Airflow -> SSH vm1 -> launch_bronze_to_silver.sh -> spark-submit-yt/SPYT
+  State/log lineage пишется в S3: _state/greenhub_silver_runs.json
 """
 
 from __future__ import annotations
@@ -41,7 +34,6 @@ from airflow.providers.ssh.hooks.ssh import SSHHook
 
 logger = logging.getLogger(__name__)
 
-
 DATASET_TAG = "greenhub"
 LOADER_NAME = "spyt_bronze_to_silver"
 
@@ -49,17 +41,33 @@ ROW_IN_RE = re.compile(r"\[DONE\]\s+bronze fact in\s*:\s*([\d,]+)")
 ROW_DEDUP_RE = re.compile(r"\[DONE\]\s+after dedup\s*:\s*([\d,]+)")
 ROW_OUT_RE = re.compile(r"\[DONE\]\s+silver out\s*:\s*([\d,]+)")
 
+REMOTE_LOG_DIR = "/home/chig_k3s/git/spyt-logs"
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def q(value: Any) -> str:
+    return shlex.quote("" if value is None else str(value))
+
+
+def safe_name(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
+
+
 def load_json_from_s3(hook: S3Hook, bucket_name: str, key: str, default: Any) -> Any:
     if not hook.check_for_key(key=key, bucket_name=bucket_name):
         return default
-    body = hook.get_key(key=key, bucket_name=bucket_name).get()["Body"].read()
+
+    obj = hook.get_key(key=key, bucket_name=bucket_name)
+    if obj is None:
+        return default
+
+    body = obj.get()["Body"].read()
     if not body:
         return default
+
     try:
         return json.loads(body.decode("utf-8"))
     except json.JSONDecodeError:
@@ -67,27 +75,79 @@ def load_json_from_s3(hook: S3Hook, bucket_name: str, key: str, default: Any) ->
 
 
 def save_json_to_s3(hook: S3Hook, bucket_name: str, key: str, data: Any) -> None:
-    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
     hook.load_bytes(bytes_data=payload, bucket_name=bucket_name, key=key, replace=True)
 
 
 def empty_silver_state() -> dict[str, Any]:
+    now = now_utc_iso()
     return {
         "schema_version": 1,
         "dataset": DATASET_TAG,
         "loader": LOADER_NAME,
         "last_success": None,
         "events": [],
-        "created_at": now_utc_iso(),
-        "updated_at": now_utc_iso(),
+        "created_at": now,
+        "updated_at": now,
     }
+
+
+def build_remote_command(batch_id: str) -> str:
+    launcher = Variable.get(
+        "GREENHUB_BRONZE_SILVER_LAUNCHER",
+        default_var="/home/chig_k3s/git/repo/spyt/launch_bronze_to_silver.sh",
+    )
+    yt_proxy = Variable.get("YT_PROXY", default_var="http://localhost:31103")
+
+    remote_log = f"{REMOTE_LOG_DIR}/bronze_to_silver_{safe_name(batch_id)}.log"
+
+    return f"""
+set -u
+
+mkdir -p {q(REMOTE_LOG_DIR)}
+
+export BATCH_ID={q(batch_id)}
+export YT_PROXY={q(yt_proxy)}
+export YT_USE_HOSTS=0
+export DRIVER_HOST=10.130.0.24
+export SPARK_LOCAL_IP=10.130.0.24
+
+echo "[AIRFLOW] host=$(hostname)"
+echo "[AIRFLOW] started_at=$(date -Is)"
+echo "[AIRFLOW] launcher={launcher}"
+echo "[AIRFLOW] full_log={remote_log}"
+
+set +e
+
+{q(launcher)} > {q(remote_log)} 2>&1
+
+RC=$?
+
+echo "[AIRFLOW] spark_rc=$RC"
+echo "[AIRFLOW] finished_at=$(date -Is)"
+echo "[AIRFLOW] full_log={remote_log}"
+
+echo ""
+echo "========== ERROR GREP =========="
+grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected|PYTHON_VERSION_MISMATCH' {q(remote_log)} | head -n 240 || true
+
+echo ""
+echo "========== DONE GREP =========="
+grep -n -Ei '\\[DONE\\]|\\[INFO\\] bronze fact rows|\\[INFO\\] silver wide rows|writing silver' {q(remote_log)} || true
+
+echo ""
+echo "========== FULL LOG TAIL 300 =========="
+tail -n 300 {q(remote_log)} || true
+
+exit $RC
+""".strip()
 
 
 @dag(
     dag_id="greenhub_bronze_to_silver",
-    description="YT bronze fact ⋈ 12 dim → silver wide (greenhub_telemetry)",
-    schedule=timedelta(minutes=45),
-    start_date=datetime(2026, 5, 7),
+    description="YT bronze fact + dim -> silver wide greenhub_telemetry",
+    schedule=None,
+    start_date=datetime(2026, 5, 7, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
     default_args={
@@ -101,9 +161,9 @@ def greenhub_bronze_to_silver():
 
     @task
     def make_batch_id() -> str:
-        bid = str(_uuid.uuid4())
-        logger.info("batch_id = %s", bid)
-        return bid
+        batch_id = str(_uuid.uuid4())
+        logger.info("batch_id=%s", batch_id)
+        return batch_id
 
     @task(
         pool="spyt_pool",
@@ -114,20 +174,10 @@ def greenhub_bronze_to_silver():
     def submit_bronze_to_silver(batch_id: str) -> dict[str, Any]:
         started_at = now_utc_iso()
 
-        ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID",            default_var="vm1_ssh")
-        launcher = Variable.get(
-            "GREENHUB_BRONZE_SILVER_LAUNCHER",
-            default_var="/home/chig_k3s/main_d/spyt/launch_bronze_to_silver.sh",
-        )
-        yt_proxy    = Variable.get("YT_PROXY",                        default_var="http://localhost:31103")
+        ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
+        command = build_remote_command(batch_id)
 
-        remote_cmd = (
-            f"BATCH_ID={shlex.quote(batch_id)} "
-            f"YT_PROXY={shlex.quote(yt_proxy)} "
-            f"YT_USE_HOSTS=0 "
-            f"{shlex.quote(launcher)}"
-        )
-        logger.info("SSH (%s): %s", ssh_conn_id, remote_cmd)
+        logger.info("SSH (%s) submit command:\n%s", ssh_conn_id, command)
 
         result: dict[str, Any] = {
             "batch_id": batch_id,
@@ -145,10 +195,10 @@ def greenhub_bronze_to_silver():
         try:
             ssh = SSHHook(ssh_conn_id=ssh_conn_id, conn_timeout=30)
             with ssh.get_conn() as conn:
-                stdin, stdout, stderr = conn.exec_command(remote_cmd, timeout=3600)
-                rc = stdout.channel.recv_exit_status()
+                stdin, stdout, stderr = conn.exec_command(command, get_pty=True, timeout=3600)
                 out_str = stdout.read().decode("utf-8", errors="replace")
                 err_str = stderr.read().decode("utf-8", errors="replace")
+                rc = stdout.channel.recv_exit_status()
         except Exception as exc:
             logger.exception("SSH/spark-submit transport error")
             return {
@@ -158,29 +208,31 @@ def greenhub_bronze_to_silver():
                 "error": repr(exc),
             }
 
+        print("========== REMOTE STDOUT ==========")
+        print(out_str[-30000:] if out_str else "<empty>")
+
+        print("========== REMOTE STDERR ==========")
+        print(err_str[-30000:] if err_str else "<empty>")
+
         if (m := ROW_IN_RE.search(out_str)):
-            result["rows_bronze_in"]   = int(m.group(1).replace(",", ""))
+            result["rows_bronze_in"] = int(m.group(1).replace(",", ""))
         if (m := ROW_DEDUP_RE.search(out_str)):
             result["rows_after_dedup"] = int(m.group(1).replace(",", ""))
         if (m := ROW_OUT_RE.search(out_str)):
-            result["rows_silver_out"]  = int(m.group(1).replace(",", ""))
+            result["rows_silver_out"] = int(m.group(1).replace(",", ""))
 
-        logger.info("STDOUT tail (4kb):\n%s", out_str[-4096:] if out_str else "<empty>")
+        finished_at = now_utc_iso()
 
         if rc != 0:
-            logger.error("STDERR tail (4kb):\n%s", err_str[-4096:] if err_str else "<empty>")
-            return {
-                **result,
-                "load_status": "FAILED",
-                "finished_at": now_utc_iso(),
-                "rc": rc,
-                "error": f"spark-submit-yt exit={rc}; stderr_tail={err_str[-1024:]}",
-            }
+            raise RuntimeError(
+                f"SPYT bronze_to_silver failed with rc={rc}. "
+                f"Check REMOTE STDOUT above; it includes ERROR GREP and full remote log tail."
+            )
 
         return {
             **result,
             "load_status": "SUCCESS",
-            "finished_at": now_utc_iso(),
+            "finished_at": finished_at,
             "rc": rc,
             "error": None,
         }
@@ -191,18 +243,18 @@ def greenhub_bronze_to_silver():
             logger.info("No silver run to record")
             return
 
-        aws_conn  = Variable.get("GREENHUB_AWS_CONN_ID", default_var="seaweedfs_s3")
+        aws_conn = Variable.get("GREENHUB_AWS_CONN_ID", default_var="seaweedfs_s3")
         bucket = Variable.get("GREENHUB_S3_BUCKET", default_var="greenhub")
         state_key = Variable.get(
             "GREENHUB_SILVER_STATE_KEY",
             default_var="_state/greenhub_silver_runs.json",
         )
-        s3 = S3Hook(aws_conn_id=aws_conn)
 
+        s3 = S3Hook(aws_conn_id=aws_conn)
         state = load_json_from_s3(s3, bucket, state_key, empty_silver_state())
         state.setdefault("events", [])
 
-        state["events"].append({
+        event = {
             "event_at": now_utc_iso(),
             "batch_id": result.get("batch_id"),
             "load_status": result.get("load_status"),
@@ -213,7 +265,8 @@ def greenhub_bronze_to_silver():
             "finished_at": result.get("finished_at"),
             "rc": result.get("rc"),
             "error": result.get("error"),
-        })
+        }
+        state["events"].append(event)
 
         if result.get("load_status") == "SUCCESS":
             state["last_success"] = {
@@ -226,9 +279,8 @@ def greenhub_bronze_to_silver():
         save_json_to_s3(s3, bucket, state_key, state)
         logger.info("Silver state %s/%s updated", bucket, state_key)
 
-
     batch_id = make_batch_id()
-    result   = submit_bronze_to_silver(batch_id)
+    result = submit_bronze_to_silver(batch_id)
     mark_silver_run(result)
 
 
