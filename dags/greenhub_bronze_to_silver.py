@@ -4,12 +4,8 @@ greenhub_bronze_to_silver.py
 
 DAG-2: YTsaurus bronze fact + dim -> silver wide table.
 
-Триггер:
-  вручную или по расписанию.
-
-Логика:
-  Airflow -> SSH vm1 -> launch_bronze_to_silver.sh -> spark-submit-yt/SPYT
-  State/log lineage пишется в S3: _state/greenhub_silver_runs.json
+Airflow -> SSH vm1 -> bash launch_bronze_to_silver.sh -> spark-submit-yt/SPYT.
+State/log lineage пишется в S3: _state/greenhub_silver_runs.json.
 """
 
 from __future__ import annotations
@@ -119,7 +115,7 @@ echo "[AIRFLOW] full_log={remote_log}"
 
 set +e
 
-{q(launcher)} > {q(remote_log)} 2>&1
+bash {q(launcher)} > {q(remote_log)} 2>&1
 
 RC=$?
 
@@ -129,7 +125,7 @@ echo "[AIRFLOW] full_log={remote_log}"
 
 echo ""
 echo "========== ERROR GREP =========="
-grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected|PYTHON_VERSION_MISMATCH' {q(remote_log)} | head -n 240 || true
+grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected|PYTHON_VERSION_MISMATCH|Permission denied' {q(remote_log)} | head -n 240 || true
 
 echo ""
 echo "========== DONE GREP =========="
@@ -173,7 +169,6 @@ def greenhub_bronze_to_silver():
     )
     def submit_bronze_to_silver(batch_id: str) -> dict[str, Any]:
         started_at = now_utc_iso()
-
         ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
         command = build_remote_command(batch_id)
 
