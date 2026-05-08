@@ -1,20 +1,6 @@
 #!/usr/bin/env bash
-# launch_raw_to_bronze.sh
-# Запуск PySpark job raw_to_bronze_greenhub.py.
-#
-# Аргументы:
-#   1) путь к parquet в S3, например: s3a://greenhub/part-0000.parquet
-#   2) порядковый номер части, например: 0
-#
-# Пример:
-#   BATCH_ID=$(uuidgen) ./launch_raw_to_bronze.sh s3a://greenhub/part-0000.parquet 0
-#
-# Требования env:
-#   S3_ACCESS_KEY, S3_SECRET_KEY
-#   опционально: BATCH_ID, DRIVER_HOST, YT_PROXY, SPARK_LOCAL_IP
 
 set -euo pipefail
-
 
 if [[ -f /home/chig_k3s/yt-env/bin/activate ]]; then
     source /home/chig_k3s/yt-env/bin/activate
@@ -22,8 +8,8 @@ fi
 
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 export PATH="$JAVA_HOME/bin:/home/chig_k3s/yt-env/bin:$PATH"
-
 export YT_PROXY="${YT_PROXY:-http://localhost:31103}"
+export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-10.130.0.24}"
 
 if [[ -z "${YT_TOKEN:-}" && -f /home/chig_k3s/.yt/token ]]; then
     export YT_TOKEN="$(cat /home/chig_k3s/.yt/token)"
@@ -34,16 +20,11 @@ if [[ -z "${YT_TOKEN:-}" ]]; then
     exit 1
 fi
 
-export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-10.130.0.24}"
-
-
-
 INPUT="${1:?Usage: $0 <s3a-path> <part-index>}"
 PART_INDEX="${2:?Usage: $0 <s3a-path> <part-index>}"
 BATCH_ID="${BATCH_ID:-$(uuidgen)}"
 
 DRIVER_HOST="${DRIVER_HOST:-10.130.0.24}"
-YT_PROXY="${YT_PROXY:-http://localhost:31103}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOB_FILE="$SCRIPT_DIR/raw_to_bronze_greenhub.py"
@@ -63,7 +44,6 @@ if [[ ! -x /home/chig_k3s/yt-env/bin/spark-submit-yt ]]; then
     exit 1
 fi
 
-
 echo "Input: $INPUT"
 echo "Part index: $PART_INDEX"
 echo "Batch ID: $BATCH_ID"
@@ -74,7 +54,6 @@ echo "Job file: $JOB_FILE"
 echo "spark-submit-yt: $(command -v spark-submit-yt || true)"
 echo "JAVA_HOME: $JAVA_HOME"
 
-
 /home/chig_k3s/yt-env/bin/spark-submit-yt \
   --proxy localhost:31103 \
   --discovery-path //home/spark/discovery/main \
@@ -83,6 +62,12 @@ echo "JAVA_HOME: $JAVA_HOME"
   --conf spark.executor.memory=1g \
   --conf spark.driver.host="$DRIVER_HOST" \
   --conf spark.driver.bindAddress=0.0.0.0 \
+  --conf spark.driver.port=28001 \
+  --conf spark.blockManager.port=28002 \
+  --conf spark.ui.port=28003 \
+  --conf spark.port.maxRetries=32 \
+  --conf spark.network.timeout=300s \
+  --conf spark.executor.heartbeatInterval=30s \
   --conf spark.hadoop.fs.s3a.endpoint=http://10.130.0.35:8333 \
   --conf spark.hadoop.fs.s3a.access.key="$S3_ACCESS_KEY" \
   --conf spark.hadoop.fs.s3a.secret.key="$S3_SECRET_KEY" \
