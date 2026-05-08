@@ -1,21 +1,30 @@
-cat > ~/main_d/create_bronze_tables.sh <<'BASH'
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
 
-# Корневая
-yt create map_node //home/bronze_stage/greenhub --recursive --ignore-existing
+set -euo pipefail
 
-# fact_telemetry
+yt create map_node //home/bronze_stage --ignore-existing
+yt create map_node //home/bronze_stage/greenhub --ignore-existing
+
+yt remove --force //home/bronze_stage/greenhub/fact_telemetry || true
+yt remove --force //home/bronze_stage/greenhub/dim_device || true
+
+for dim in country timezone battery_state network_status charger health \
+           network_type mobile_network_type mobile_data_status \
+           mobile_data_activity wifi_status; do
+  yt remove --force //home/bronze_stage/greenhub/dim_${dim} || true
+done
+
 yt create table //home/bronze_stage/greenhub/fact_telemetry --attributes '{
   schema=[
-    {name=fact_uid;                   type=string;   required=%true};
-    {name=source_id;                  type=int64;    required=%true};
-    {name=device_uid;                 type=string;   required=%true};
-    {name=timestamp;                  type=timestamp;required=%true};
-    {name=country_uid;                type=string;   required=%true};
-    {name=timezone_uid;               type=string;   required=%true};
-    {name=battery_state_uid;          type=string;   required=%true};
-    {name=network_status_uid;         type=string;   required=%true};
+    {name=fact_uid;                   type=string;  required=%true};
+    {name=source_id;                  type=int64;   required=%true};
+    {name=device_uid;                 type=string;  required=%true};
+    {name=event_ts_str;               type=string;  required=%true};
+    {name=event_date;                 type=string;  required=%true};
+    {name=country_uid;                type=string;  required=%true};
+    {name=timezone_uid;               type=string;  required=%true};
+    {name=battery_state_uid;          type=string;  required=%true};
+    {name=network_status_uid;         type=string;  required=%true};
     {name=charger_uid;                type=string};
     {name=health_uid;                 type=string};
     {name=network_type_uid;           type=string};
@@ -47,15 +56,14 @@ yt create table //home/bronze_stage/greenhub/fact_telemetry --attributes '{
     {name=power_saver_enabled;        type=boolean};
     {name=nfc_enabled;                type=boolean};
     {name=developer_mode;             type=boolean};
-    {name=_source_file;               type=string;   required=%true};
-    {name=_file_hash;                 type=string;   required=%true};
-    {name=_loaded_at;                 type=timestamp;required=%true};
-    {name=_batch_id;                  type=string;   required=%true};
-    {name=_part_index;                type=int64;    required=%true};
+    {name=_source_file;               type=string;  required=%true};
+    {name=_file_hash;                 type=string;  required=%true};
+    {name=_loaded_at;                 type=string;  required=%true};
+    {name=_batch_id;                  type=string;  required=%true};
+    {name=_part_index;                type=int64;   required=%true};
   ];
 }'
 
-# dim таблицы — простой формат (raw_value, uid, first_seen, _loaded_at)
 for dim in country timezone battery_state network_status charger health \
            network_type mobile_network_type mobile_data_status \
            mobile_data_activity wifi_status; do
@@ -63,24 +71,19 @@ for dim in country timezone battery_state network_status charger health \
     schema=[
       {name=${dim}_uid; type=string; required=%true};
       {name=raw_value;  type=string; required=%true};
-      {name=first_seen; type=timestamp; required=%true};
-      {name=_loaded_at; type=timestamp; required=%true};
+      {name=first_seen; type=string; required=%true};
+      {name=_loaded_at; type=string; required=%true};
     ];
   }"
 done
 
-# dim_device отдельно — ключ device_id
 yt create table //home/bronze_stage/greenhub/dim_device --attributes '{
   schema=[
     {name=device_uid; type=string; required=%true};
     {name=device_id;  type=int64;  required=%true};
-    {name=first_seen; type=timestamp; required=%true};
-    {name=_loaded_at; type=timestamp; required=%true};
+    {name=first_seen; type=string; required=%true};
+    {name=_loaded_at; type=string; required=%true};
   ];
 }'
 
-echo "Created tables:"
 yt list //home/bronze_stage/greenhub
-BASH
-chmod +x ~/main_d/create_bronze_tables.sh
-~/main_d/create_bronze_tables.sh
