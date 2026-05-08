@@ -41,20 +41,31 @@ if [[ ! -x /home/chig_k3s/yt-env/bin/spark-submit-yt ]]; then
 fi
 
 case "$MART" in
-  daily_country_stats|country_overview|device_lifecycle|hourly_battery_health)
+  daily_country_stats)
+    DRIVER_PORT=28311
+    BLOCK_PORT=28312
+    UI_PORT=28313
+    ;;
+  country_overview)
+    DRIVER_PORT=28321
+    BLOCK_PORT=28322
+    UI_PORT=28323
+    ;;
+  device_lifecycle)
+    DRIVER_PORT=28331
+    BLOCK_PORT=28332
+    UI_PORT=28333
+    ;;
+  hourly_battery_health)
+    DRIVER_PORT=28341
+    BLOCK_PORT=28342
+    UI_PORT=28343
     ;;
   *)
     echo "ERROR: unknown mart: $MART" >&2
     echo "Allowed: daily_country_stats country_overview device_lifecycle hourly_battery_health" >&2
     exit 1
     ;;
-esac
-
-case "$MART" in
-  daily_country_stats)      PORT_BASE=28310 ;;
-  country_overview)         PORT_BASE=28320 ;;
-  device_lifecycle)         PORT_BASE=28330 ;;
-  hourly_battery_health)    PORT_BASE=28340 ;;
 esac
 
 echo "Stage:          silver -> gold (greenhub)"
@@ -68,6 +79,9 @@ echo "YT proxy:       $YT_PROXY"
 echo "Job file:       $JOB_FILE"
 echo "spark-submit:   $(command -v spark-submit-yt || true)"
 echo "JAVA_HOME:      $JAVA_HOME"
+echo "Driver port:    $DRIVER_PORT"
+echo "Block port:     $BLOCK_PORT"
+echo "UI port:        $UI_PORT"
 
 /home/chig_k3s/yt-env/bin/spark-submit-yt \
   --proxy localhost:31103 \
@@ -79,9 +93,9 @@ echo "JAVA_HOME:      $JAVA_HOME"
   --conf spark.driver.memory=2g \
   --conf spark.driver.host="$DRIVER_HOST" \
   --conf spark.driver.bindAddress=0.0.0.0 \
-  --conf spark.driver.port="${PORT_BASE}1" \
-  --conf spark.blockManager.port="${PORT_BASE}2" \
-  --conf spark.ui.port="${PORT_BASE}3" \
+  --conf spark.driver.port="$DRIVER_PORT" \
+  --conf spark.blockManager.port="$BLOCK_PORT" \
+  --conf spark.ui.port="$UI_PORT" \
   --conf spark.port.maxRetries=32 \
   --conf spark.network.timeout=300s \
   --conf spark.executor.heartbeatInterval=30s \
