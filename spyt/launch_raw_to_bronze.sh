@@ -18,7 +18,7 @@ BATCH_ID="${BATCH_ID:-$(uuidgen)}"
 DRIVER_HOST="${DRIVER_HOST:-10.130.0.24}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JOB_FILE="$SCRIPT_DIR/jobs/raw_to_bronze_greenhub.py"
+JOB_FILE="$SCRIPT_DIR/raw_to_bronze_greenhub.py"
 
 if [[ ! -f "$JOB_FILE" ]]; then
     echo "ERROR: job file not found: $JOB_FILE" >&2
