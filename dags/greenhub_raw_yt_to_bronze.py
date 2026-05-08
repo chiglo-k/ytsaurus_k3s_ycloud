@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-greenhub_silver_to_gold.py
+greenhub_raw_yt_to_bronze.py
 
-DAG-3: YTsaurus silver wide table -> gold marts.
+DAG: YTsaurus raw table/parquet-in-Cypress -> bronze fact + dim.
 
-Airflow -> SSH vm1 -> bash launch_silver_to_gold.sh <mart> -> spark-submit-yt/SPYT.
+Airflow -> SSH vm1 -> bash launch_raw_yt_to_bronze.sh -> spark-submit-yt/SPYT.
 """
 
 from __future__ import annotations
@@ -30,17 +30,11 @@ from airflow.providers.ssh.hooks.ssh import SSHHook
 logger = logging.getLogger(__name__)
 
 DATASET_TAG = "greenhub"
-LOADER_NAME = "spyt_silver_to_gold"
+LOADER_NAME = "spyt_raw_yt_to_bronze"
 
-MARTS = [
-    "daily_country_stats",
-    "country_overview",
-    "device_lifecycle",
-    "hourly_battery_health",
-]
-
-ROW_SILVER_RE = re.compile(r"\[DONE\]\s+silver in\s*:\s*([\d,]+)")
-ROW_GOLD_RE = re.compile(r"\[DONE\]\s+gold rows\s*:\s*([\d,]+)")
+ROW_SOURCE_RE = re.compile(r"\[DONE\]\s+source rows\s*:\s*([\d,]+)")
+ROW_FACT_RE = re.compile(r"\[DONE\]\s+fact rows\s*:\s*([\d,]+)")
+ROW_DEVICE_RE = re.compile(r"\[DONE\]\s+dim_device\s*:\s*([\d,]+)")
 
 REMOTE_LOG_DIR = "/home/chig_k3s/git/spyt-logs"
 
@@ -80,27 +74,29 @@ def save_json_to_s3(hook: S3Hook, bucket_name: str, key: str, data: Any) -> None
     hook.load_bytes(bytes_data=payload, bucket_name=bucket_name, key=key, replace=True)
 
 
-def empty_gold_state() -> dict[str, Any]:
+def empty_bronze_state() -> dict[str, Any]:
     now = now_utc_iso()
     return {
         "schema_version": 1,
         "dataset": DATASET_TAG,
         "loader": LOADER_NAME,
-        "last_success": {},
+        "last_success": None,
         "events": [],
         "created_at": now,
         "updated_at": now,
     }
 
 
-def build_remote_command(mart: str, batch_id: str) -> str:
+def build_remote_command(batch_id: str) -> str:
     launcher = Variable.get(
-        "GREENHUB_SILVER_GOLD_LAUNCHER",
-        default_var="/home/chig_k3s/git/repo/spyt/launch_silver_to_gold.sh",
+        "GREENHUB_RAW_YT_BRONZE_LAUNCHER",
+        default_var="/home/chig_k3s/git/repo/spyt/launch_raw_yt_to_bronze.sh",
     )
     yt_proxy = Variable.get("YT_PROXY", default_var="http://localhost:31103")
+    raw_path = Variable.get("GREENHUB_RAW_YT_PATH", default_var="//home/raw/greenhub")
+    bronze_root = Variable.get("GREENHUB_BRONZE_ROOT", default_var="//home/bronze_stage/greenhub")
 
-    remote_log = f"{REMOTE_LOG_DIR}/silver_to_gold_{safe_name(mart)}_{safe_name(batch_id)}.log"
+    remote_log = f"{REMOTE_LOG_DIR}/raw_yt_to_bronze_{safe_name(batch_id)}.log"
 
     return f"""
 set -u
@@ -108,6 +104,9 @@ set -u
 mkdir -p {q(REMOTE_LOG_DIR)}
 
 export BATCH_ID={q(batch_id)}
+export RAW_PATH={q(raw_path)}
+export BRONZE_ROOT={q(bronze_root)}
+export PART_INDEX=0
 export YT_PROXY={q(yt_proxy)}
 export YT_USE_HOSTS=0
 export DRIVER_HOST=10.130.0.24
@@ -115,13 +114,14 @@ export SPARK_LOCAL_IP=10.130.0.24
 
 echo "[AIRFLOW] host=$(hostname)"
 echo "[AIRFLOW] started_at=$(date -Is)"
-echo "[AIRFLOW] mart={mart}"
 echo "[AIRFLOW] launcher={launcher}"
+echo "[AIRFLOW] raw_path={raw_path}"
+echo "[AIRFLOW] bronze_root={bronze_root}"
 echo "[AIRFLOW] full_log={remote_log}"
 
 set +e
 
-bash {q(launcher)} {q(mart)} > {q(remote_log)} 2>&1
+bash {q(launcher)} > {q(remote_log)} 2>&1
 
 RC=$?
 
@@ -131,11 +131,11 @@ echo "[AIRFLOW] full_log={remote_log}"
 
 echo ""
 echo "========== ERROR GREP =========="
-grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected|PYTHON_VERSION_MISMATCH|unknown mart|Permission denied' {q(remote_log)} | head -n 240 || true
+grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected|PYTHON_VERSION_MISMATCH|Permission denied|No such file' {q(remote_log)} | head -n 240 || true
 
 echo ""
 echo "========== DONE GREP =========="
-grep -n -Ei '\\[DONE\\]|\\[INFO\\] silver rows in|\\[INFO\\] mart rows out|writing' {q(remote_log)} || true
+grep -n -Ei '\\[DONE\\]|\\[INFO\\] Source rows|\\[INFO\\] fact rows ready|dim_device' {q(remote_log)} || true
 
 echo ""
 echo "========== FULL LOG TAIL 300 =========="
@@ -146,8 +146,8 @@ exit $RC
 
 
 @dag(
-    dag_id="greenhub_silver_to_gold",
-    description="YT silver greenhub_telemetry -> gold marts",
+    dag_id="greenhub_raw_yt_to_bronze",
+    description="YT raw greenhub table -> bronze fact + dim",
     schedule=None,
     start_date=datetime(2026, 5, 7, tzinfo=timezone.utc),
     catchup=False,
@@ -157,9 +157,9 @@ exit $RC
         "retries": 1,
         "retry_delay": timedelta(minutes=2),
     },
-    tags=["greenhub", "spyt", "gold", "diploma"],
+    tags=["greenhub", "spyt", "raw", "bronze", "diploma"],
 )
-def greenhub_silver_to_gold():
+def greenhub_raw_yt_to_bronze():
 
     @task
     def make_batch_id() -> str:
@@ -167,33 +167,29 @@ def greenhub_silver_to_gold():
         logger.info("batch_id=%s", batch_id)
         return batch_id
 
-    @task
-    def list_marts() -> list[str]:
-        return MARTS
-
     @task(
         pool="spyt_pool",
         execution_timeout=timedelta(minutes=60),
         retries=1,
         retry_delay=timedelta(minutes=3),
     )
-    def submit_gold_mart(mart: str, batch_id: str) -> dict[str, Any]:
+    def submit_raw_yt_to_bronze(batch_id: str) -> dict[str, Any]:
         started_at = now_utc_iso()
         ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
-        command = build_remote_command(mart, batch_id)
+        command = build_remote_command(batch_id)
 
-        logger.info("SSH (%s) mart=%s command:\n%s", ssh_conn_id, mart, command)
+        logger.info("SSH (%s) raw_yt_to_bronze command:\n%s", ssh_conn_id, command)
 
         result: dict[str, Any] = {
-            "mart": mart,
             "batch_id": batch_id,
             "loader": LOADER_NAME,
             "started_at": started_at,
             "finished_at": None,
             "load_status": None,
             "rc": None,
-            "rows_silver_in": None,
-            "rows_gold_out": None,
+            "rows_source": None,
+            "rows_fact": None,
+            "rows_dim_device": None,
             "error": None,
         }
 
@@ -205,7 +201,7 @@ def greenhub_silver_to_gold():
                 err_str = stderr.read().decode("utf-8", errors="replace")
                 rc = stdout.channel.recv_exit_status()
         except Exception as exc:
-            logger.exception("SSH/spark-submit transport error for mart=%s", mart)
+            logger.exception("SSH/spark-submit transport error")
             return {
                 **result,
                 "load_status": "FAILED_TRANSPORT",
@@ -213,22 +209,24 @@ def greenhub_silver_to_gold():
                 "error": repr(exc),
             }
 
-        print(f"========== REMOTE STDOUT mart={mart} ==========")
+        print("========== REMOTE STDOUT raw_yt_to_bronze ==========")
         print(out_str[-30000:] if out_str else "<empty>")
 
-        print(f"========== REMOTE STDERR mart={mart} ==========")
+        print("========== REMOTE STDERR raw_yt_to_bronze ==========")
         print(err_str[-30000:] if err_str else "<empty>")
 
-        if (m := ROW_SILVER_RE.search(out_str)):
-            result["rows_silver_in"] = int(m.group(1).replace(",", ""))
-        if (m := ROW_GOLD_RE.search(out_str)):
-            result["rows_gold_out"] = int(m.group(1).replace(",", ""))
+        if (m := ROW_SOURCE_RE.search(out_str)):
+            result["rows_source"] = int(m.group(1).replace(",", ""))
+        if (m := ROW_FACT_RE.search(out_str)):
+            result["rows_fact"] = int(m.group(1).replace(",", ""))
+        if (m := ROW_DEVICE_RE.search(out_str)):
+            result["rows_dim_device"] = int(m.group(1).replace(",", ""))
 
         finished_at = now_utc_iso()
 
         if rc != 0:
             raise RuntimeError(
-                f"SPYT silver_to_gold mart={mart} failed with rc={rc}. "
+                f"SPYT raw_yt_to_bronze failed with rc={rc}. "
                 f"Check REMOTE STDOUT above; it includes ERROR GREP and full remote log tail."
             )
 
@@ -241,53 +239,51 @@ def greenhub_silver_to_gold():
         }
 
     @task(trigger_rule="none_failed_min_one_success")
-    def mark_gold_runs(results: list[dict[str, Any]]) -> None:
-        if not results:
-            logger.info("No gold runs to record")
+    def mark_bronze_run(result: dict[str, Any]) -> None:
+        if not result:
+            logger.info("No bronze run to record")
             return
 
         aws_conn = Variable.get("GREENHUB_AWS_CONN_ID", default_var="seaweedfs_s3")
         bucket = Variable.get("GREENHUB_S3_BUCKET", default_var="greenhub")
         state_key = Variable.get(
-            "GREENHUB_GOLD_STATE_KEY",
-            default_var="_state/greenhub_gold_runs.json",
+            "GREENHUB_RAW_YT_BRONZE_STATE_KEY",
+            default_var="_state/greenhub_raw_yt_to_bronze_runs.json",
         )
 
         s3 = S3Hook(aws_conn_id=aws_conn)
-        state = load_json_from_s3(s3, bucket, state_key, empty_gold_state())
+        state = load_json_from_s3(s3, bucket, state_key, empty_bronze_state())
         state.setdefault("events", [])
-        state.setdefault("last_success", {})
 
-        for item in results:
-            event = {
-                "event_at": now_utc_iso(),
-                "mart": item.get("mart"),
-                "batch_id": item.get("batch_id"),
-                "load_status": item.get("load_status"),
-                "rows_silver_in": item.get("rows_silver_in"),
-                "rows_gold_out": item.get("rows_gold_out"),
-                "started_at": item.get("started_at"),
-                "finished_at": item.get("finished_at"),
-                "rc": item.get("rc"),
-                "error": item.get("error"),
+        event = {
+            "event_at": now_utc_iso(),
+            "batch_id": result.get("batch_id"),
+            "load_status": result.get("load_status"),
+            "rows_source": result.get("rows_source"),
+            "rows_fact": result.get("rows_fact"),
+            "rows_dim_device": result.get("rows_dim_device"),
+            "started_at": result.get("started_at"),
+            "finished_at": result.get("finished_at"),
+            "rc": result.get("rc"),
+            "error": result.get("error"),
+        }
+        state["events"].append(event)
+
+        if result.get("load_status") == "SUCCESS":
+            state["last_success"] = {
+                "batch_id": result.get("batch_id"),
+                "finished_at": result.get("finished_at"),
+                "rows_fact": result.get("rows_fact"),
+                "rows_dim_device": result.get("rows_dim_device"),
             }
-            state["events"].append(event)
-
-            if item.get("load_status") == "SUCCESS":
-                state["last_success"][item.get("mart")] = {
-                    "batch_id": item.get("batch_id"),
-                    "finished_at": item.get("finished_at"),
-                    "rows_gold_out": item.get("rows_gold_out"),
-                }
 
         state["updated_at"] = now_utc_iso()
         save_json_to_s3(s3, bucket, state_key, state)
-        logger.info("Gold state %s/%s updated", bucket, state_key)
+        logger.info("Raw YT -> bronze state %s/%s updated", bucket, state_key)
 
     batch_id = make_batch_id()
-    marts = list_marts()
-    results = submit_gold_mart.partial(batch_id=batch_id).expand(mart=marts)
-    mark_gold_runs(results)
+    result = submit_raw_yt_to_bronze(batch_id)
+    mark_bronze_run(result)
 
 
-dag = greenhub_silver_to_gold()
+dag = greenhub_raw_yt_to_bronze()
