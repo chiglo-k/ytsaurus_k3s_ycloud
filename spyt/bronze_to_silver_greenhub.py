@@ -15,7 +15,13 @@ SILVER_PATH = "//home/silver_stage/greenhub_telemetry"
 
 
 def yt_table_path(path: str) -> str:
-    return "ytTable:" + path.removeprefix("/")
+    if path.startswith("ytTable:"):
+        return path
+    if path.startswith("//"):
+        return "ytTable:" + path[1:]
+    if path.startswith("/"):
+        return "ytTable:" + path
+    return "ytTable:/" + path
 
 
 def read_yt(spark: SparkSession, path: str):
@@ -38,6 +44,8 @@ def main() -> int:
     print(f"[INFO] batch_id    = {args.batch_id}", flush=True)
     print(f"[INFO] bronze root = {args.bronze_root}", flush=True)
     print(f"[INFO] silver path = {args.silver_path}", flush=True)
+    print(f"[INFO] bronze fact = {yt_table_path(f'{args.bronze_root}/fact_telemetry')}", flush=True)
+    print(f"[INFO] silver out  = {yt_table_path(args.silver_path)}", flush=True)
 
     fact = read_yt(spark, f"{args.bronze_root}/fact_telemetry")
     fact_count_in = fact.count()
