@@ -83,8 +83,15 @@ def main() -> int:
     print(f"[INFO] Reading {args.input}", flush=True)
 
     df_raw = spark.read.parquet(args.input)
-    df_raw = df_raw.withColumn("timestamp", F.col("timestamp").cast("timestamp"))
-    df_raw = df_raw.cache()
+
+    df_raw = (
+        df_raw
+        .withColumn("event_ts", F.col("timestamp").cast("timestamp"))
+        .withColumn("event_ts_str", F.date_format(F.col("event_ts"), "yyyy-MM-dd HH:mm:ss"))
+        .withColumn("event_date", F.date_format(F.to_date(F.col("event_ts")), "yyyy-MM-dd"))
+        .drop("event_ts")
+        .cache()
+    )
 
     rows_in = df_raw.count()
     print(f"[INFO] Source rows: {rows_in:,}", flush=True)
@@ -95,7 +102,7 @@ def main() -> int:
     df_with_uids = (
         df_raw
         .withColumn("source_id", F.col("id").cast("long"))
-        .withColumn("fact_uid", stable_uuid_expr("fact_telemetry", "id", "device_id", "timestamp"))
+        .withColumn("fact_uid", stable_uuid_expr("fact_telemetry", "id", "device_id", "event_ts_str"))
         .withColumn("device_uid", stable_uuid_expr("dim_device", "device_id"))
         .withColumn("country_uid", stable_uuid_expr("dim_country", "country_code"))
         .withColumn("timezone_uid", stable_uuid_expr("dim_timezone", "timezone"))
@@ -117,7 +124,7 @@ def main() -> int:
         .withColumn("developer_mode", to_bool("developer_mode"))
         .withColumn("_source_file", F.lit(args.input))
         .withColumn("_file_hash", F.lit(file_hash))
-        .withColumn("_loaded_at", F.current_timestamp())
+        .withColumn("_loaded_at", F.date_format(F.current_timestamp(), "yyyy-MM-dd HH:mm:ss"))
         .withColumn("_batch_id", F.lit(args.batch_id))
         .withColumn("_part_index", F.lit(args.part_index).cast("long"))
     )
@@ -146,7 +153,8 @@ def main() -> int:
         "fact_uid",
         "source_id",
         "device_uid",
-        "timestamp",
+        "event_ts_str",
+        "event_date",
         "country_uid",
         "timezone_uid",
         "battery_state_uid",
@@ -223,7 +231,7 @@ def main() -> int:
             df_raw
             .withColumn("raw_value", raw_value_expr)
             .groupBy("raw_value")
-            .agg(F.min("timestamp").alias("first_seen"))
+            .agg(F.min("event_ts_str").alias("first_seen"))
             .withColumn(
                 f"{dim_name}_uid",
                 stable_uuid_from_value(
@@ -231,7 +239,7 @@ def main() -> int:
                     F.when(F.col("raw_value") == "__null__", None).otherwise(F.col("raw_value")),
                 ),
             )
-            .withColumn("_loaded_at", F.current_timestamp())
+            .withColumn("_loaded_at", F.date_format(F.current_timestamp(), "yyyy-MM-dd HH:mm:ss"))
             .select(f"{dim_name}_uid", "raw_value", "first_seen", "_loaded_at")
         )
 
@@ -251,9 +259,9 @@ def main() -> int:
     df_dim_device = (
         df_raw
         .groupBy("device_id")
-        .agg(F.min("timestamp").alias("first_seen"))
+        .agg(F.min("event_ts_str").alias("first_seen"))
         .withColumn("device_uid", stable_uuid_from_value("dim_device", F.col("device_id")))
-        .withColumn("_loaded_at", F.current_timestamp())
+        .withColumn("_loaded_at", F.date_format(F.current_timestamp(), "yyyy-MM-dd HH:mm:ss"))
         .select("device_uid", "device_id", "first_seen", "_loaded_at")
     )
 
