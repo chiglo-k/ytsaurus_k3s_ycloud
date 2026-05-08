@@ -23,7 +23,19 @@ fi
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 export PATH="$JAVA_HOME/bin:/home/chig_k3s/yt-env/bin:$PATH"
 
+export YT_PROXY="${YT_PROXY:-http://localhost:31103}"
+
+if [[ -z "${YT_TOKEN:-}" && -f /home/chig_k3s/.yt/token ]]; then
+    export YT_TOKEN="$(cat /home/chig_k3s/.yt/token)"
+fi
+
+if [[ -z "${YT_TOKEN:-}" ]]; then
+    echo "ERROR: YT_TOKEN is not set and /home/chig_k3s/.yt/token not found" >&2
+    exit 1
+fi
+
 export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-10.130.0.24}"
+
 
 
 INPUT="${1:?Usage: $0 <s3a-path> <part-index>}"
