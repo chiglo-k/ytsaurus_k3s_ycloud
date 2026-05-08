@@ -281,7 +281,6 @@ def get_yt_client() -> yt.YtClient:
     return yt.YtClient(
         proxy=proxy,
         token=yt_token,
-        config={"force_use_python_client": True},
     )
 
 
