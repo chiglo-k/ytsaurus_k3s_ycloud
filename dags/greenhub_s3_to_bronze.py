@@ -29,361 +29,308 @@ POOL:
     spyt_pool      slots=1 
 """
 
+#!/usr/bin/env python3
+# greenhub_s3_to_bronze.py
+
 from __future__ import annotations
 
-import io
 import json
-import logging
-import re
 import shlex
-import uuid as _uuid
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-try:
-    from airflow.sdk import dag, task
-except ImportError:
-    from airflow.decorators import dag, task
-
+from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.ssh.hooks.ssh import SSHHook
+from botocore.exceptions import ClientError
 
 
-logger = logging.getLogger(__name__)
+DAG_ID = "greenhub_s3_to_bronze"
+
+AWS_CONN_ID = "seaweedfs_s3"
+SSH_CONN_ID = "vm1_ssh"
+
+SOURCE_NAME = "greenhub"
+S3_BUCKET = "greenhub"
+S3_PREFIX = ""
+
+STATE_KEY = "_state/greenhub_load.json"
+
+SPYT_LAUNCHER = "/home/chig_k3s/git/repo/spyt/launch_raw_to_bronze.sh"
+REMOTE_LOG_DIR = "/home/chig_k3s/git/spyt-logs"
+
+DEFAULT_YT_PROXY = "http://localhost:31103"
 
 
-SOURCES_VARIABLE_KEY = "GREENHUB_S3_SOURCES"
-DATASET_TAG = "greenhub"
-LOADER_NAME = "spyt_raw_to_bronze"
-
-ROW_COUNT_RE = re.compile(r"\[DONE\]\s+fact rows\s*:\s*([\d,]+)")
-DEVICE_COUNT_RE = re.compile(r"\[DONE\]\s+dim_device\s*:\s*([\d,]+)")
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def q(value: Any) -> str:
+    return shlex.quote("" if value is None else str(value))
 
 
-def normalize_prefix(prefix: str | None) -> str:
-    if not prefix:
-        return ""
-    return prefix.strip().strip("/")
+def safe_name(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
 
 
-def make_state_key(prefix: str) -> str:
-    base = "_state"
-    if not prefix:
-        return f"{base}/{DATASET_TAG}_load.json"
-    return f"{prefix}/{base}/{DATASET_TAG}_load.json"
+def get_s3_hook() -> S3Hook:
+    return S3Hook(aws_conn_id=AWS_CONN_ID)
 
 
-def empty_state(source_name: str, bucket: str, prefix: str) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "source_name": source_name,
-        "bucket": bucket,
-        "prefix": prefix,
-        "dataset": DATASET_TAG,
-        "loader": LOADER_NAME,
-        "files": {},
-        "events": [],
-        "created_at": now_utc_iso(),
-        "updated_at": now_utc_iso(),
-    }
+def load_json_from_s3(bucket: str, key: str, default: dict | None = None) -> dict:
+    hook = get_s3_hook()
 
-
-def load_json_from_s3(hook: S3Hook, bucket_name: str, key: str, default: Any) -> Any:
-    if not hook.check_for_key(key=key, bucket_name=bucket_name):
-        logger.info("State %s/%s not found, using default", bucket_name, key)
-        return default
-    body = hook.get_key(key=key, bucket_name=bucket_name).get()["Body"].read()
-    if not body:
-        return default
     try:
-        return json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError:
-        logger.exception("Failed to decode %s/%s, using default", bucket_name, key)
-        return default
+        if not hook.check_for_key(key=key, bucket_name=bucket):
+            return default or {}
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return default or {}
+        raise
+
+    obj = hook.get_key(key=key, bucket_name=bucket)
+    if obj is None:
+        return default or {}
+
+    body = obj.get()["Body"].read().decode("utf-8")
+    if not body.strip():
+        return default or {}
+
+    return json.loads(body)
 
 
-def save_json_to_s3(hook: S3Hook, bucket_name: str, key: str, data: Any) -> None:
-    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    hook.load_bytes(bytes_data=payload, bucket_name=bucket_name, key=key, replace=True)
+def save_json_to_s3(bucket: str, key: str, payload: dict) -> None:
+    hook = get_s3_hook()
+    hook.load_string(
+        string_data=json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        key=key,
+        bucket_name=bucket,
+        replace=True,
+    )
 
 
-def is_successfully_loaded(state: dict[str, Any], load_key: str, etag: str | None) -> bool:
-    item = state.get("files", {}).get(load_key)
-    if not item:
-        return False
-    return item.get("load_status") == "SUCCESS" and item.get("source_etag") == etag
+def build_remote_command(candidate: dict, batch_id: str) -> str:
+    s3_access_key = Variable.get("S3_ACCESS_KEY")
+    s3_secret_key = Variable.get("S3_SECRET_KEY")
+    yt_proxy = Variable.get("YT_PROXY", default_var=DEFAULT_YT_PROXY)
 
+    s3a_path = candidate["s3a_path"]
+    part_index = candidate["part_index"]
 
-def iter_parquet_candidates(
-    s3: S3Hook,
-    source_name: str,
-    source: dict[str, Any],
-    state: dict[str, Any],
-) -> list[dict[str, Any]]:
-    bucket = source["bucket"]
-    prefix = normalize_prefix(source.get("prefix") or "")
-    state_key = source.get("state_key") or make_state_key(prefix)
+    remote_log = (
+        f"{REMOTE_LOG_DIR}/raw_to_bronze_"
+        f"{safe_name(batch_id)}_{safe_name(str(part_index))}.log"
+    )
 
-    keys = s3.list_keys(bucket_name=bucket, prefix=prefix or None) or []
-    keys = [k for k in keys if k.endswith(".parquet")]
+    return f"""
+set -u
 
-    out: list[dict[str, Any]] = []
-    for k in sorted(keys):
-        obj = s3.get_key(key=k, bucket_name=bucket)
-        etag = (obj.e_tag or "").strip('"')
-        size = obj.content_length
+mkdir -p {q(REMOTE_LOG_DIR)}
 
-        if is_successfully_loaded(state, k, etag):
-            continue
+export BATCH_ID={q(batch_id)}
+export S3_ACCESS_KEY={q(s3_access_key)}
+export S3_SECRET_KEY={q(s3_secret_key)}
+export YT_PROXY={q(yt_proxy)}
+export YT_USE_HOSTS=0
 
-        m = re.search(r"part-(\d+)\.parquet", k)
-        part_index = int(m.group(1)) if m else 0
+echo "[AIRFLOW] host=$(hostname)"
+echo "[AIRFLOW] started_at=$(date -Is)"
+echo "[AIRFLOW] launcher={SPYT_LAUNCHER}"
+echo "[AIRFLOW] input={s3a_path}"
+echo "[AIRFLOW] part_index={part_index}"
+echo "[AIRFLOW] full_log={remote_log}"
 
-        out.append({
-            "source_name": source_name,
-            "bucket":      bucket,
-            "prefix":      prefix,
-            "state_key":   state_key,
-            "load_key":    k,
-            "source_etag": etag,
-            "size":        size,
-            "part_index":  part_index,
-            "s3a_path":    f"s3a://{bucket}/{k}",
-        })
+set +e
 
-    return out
+{q(SPYT_LAUNCHER)} {q(s3a_path)} {q(part_index)} > {q(remote_log)} 2>&1
+
+RC=$?
+
+echo "[AIRFLOW] spark_rc=$RC"
+echo "[AIRFLOW] finished_at=$(date -Is)"
+echo "[AIRFLOW] full_log={remote_log}"
+
+echo ""
+echo "========== ERROR GREP =========="
+grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot' {q(remote_log)} | head -n 200 || true
+
+echo ""
+echo "========== FULL LOG TAIL 300 =========="
+tail -n 300 {q(remote_log)} || true
+
+exit $RC
+""".strip()
 
 
 @dag(
-    dag_id="greenhub_s3_to_bronze",
-    description="S3 (SeaweedFS) parquet -> SPYT submit -> YT bronze (fact + 12 dim)",
-    schedule=timedelta(minutes=30),
-    start_date=datetime(2026, 5, 7),
+    dag_id=DAG_ID,
+    schedule=None,
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
-    default_args={
-        "owner": "ytsaurus",
-        "retries": 1,
-        "retry_delay": timedelta(minutes=2),
-    },
-    tags=["greenhub", "spyt", "s3", "bronze", "diploma"],
+    tags=["greenhub", "s3", "spyt", "bronze"],
 )
 def greenhub_s3_to_bronze():
-
-    @task
-    def list_load_candidates() -> list[dict[str, Any]]:
-        aws_conn = Variable.get("GREENHUB_AWS_CONN_ID", default_var="seaweedfs_s3")
-        s3 = S3Hook(aws_conn_id=aws_conn)
-
-        sources_map = Variable.get(SOURCES_VARIABLE_KEY, deserialize_json=True)
-        if not isinstance(sources_map, dict):
-            raise ValueError(f"Airflow Variable {SOURCES_VARIABLE_KEY} must be a JSON object")
-
-        all_candidates: list[dict[str, Any]] = []
-
-        for source_name, source in sources_map.items():
-            if not isinstance(source, dict):
-                raise ValueError(f"Source {source_name} config must be a JSON object")
-
-            bucket = source["bucket"]
-            prefix = normalize_prefix(source.get("prefix") or "")
-            state_key = source.get("state_key") or make_state_key(prefix)
-
-            state = load_json_from_s3(
-                hook=s3,
-                bucket_name=bucket,
-                key=state_key,
-                default=empty_state(source_name, bucket, prefix),
-            )
-
-            candidates = iter_parquet_candidates(
-                s3=s3,
-                source_name=source_name,
-                source={**source, "bucket": bucket, "prefix": prefix, "state_key": state_key},
-                state=state,
-            )
-            logger.info("Source %s: %d new/changed parquet candidates",
-                        source_name, len(candidates))
-            all_candidates.extend(candidates)
-
-        logger.info("Total candidates to load: %d", len(all_candidates))
-        return all_candidates
-
     @task
     def make_batch_id() -> str:
-        bid = str(_uuid.uuid4())
-        logger.info("batch_id = %s", bid)
-        return bid
+        return str(uuid.uuid4())
 
-    @task(
-        pool="spyt_pool",
-        execution_timeout=timedelta(minutes=60),
-        retries=1,
-        retry_delay=timedelta(minutes=3),
-    )
-    def submit_spark_job(item: dict[str, Any], batch_id: str) -> dict[str, Any]:
-        """SSH -> vm1 -> launcher.sh -> spark-submit-yt -> SPYT cluster."""
-        started_at = now_utc_iso()
+    @task
+    def list_load_candidates(batch_id: str) -> list[dict]:
+        hook = get_s3_hook()
 
-        base_result: dict[str, Any] = {
-            **item,
+        state = load_json_from_s3(S3_BUCKET, STATE_KEY, default={})
+        loaded_etags = set(state.get("loaded_etags", []))
+
+        keys = hook.list_keys(bucket_name=S3_BUCKET, prefix=S3_PREFIX) or []
+
+        candidates: list[dict] = []
+        part_index = 0
+
+        for key in sorted(keys):
+            if not key.endswith(".parquet"):
+                continue
+
+            obj = hook.get_key(key=key, bucket_name=S3_BUCKET)
+            if obj is None:
+                continue
+
+            head = obj.meta.client.head_object(Bucket=S3_BUCKET, Key=key)
+            etag = head.get("ETag", "").strip('"')
+            size = int(head.get("ContentLength", 0))
+
+            if etag and etag in loaded_etags:
+                continue
+
+            s3a_path = f"s3a://{S3_BUCKET}/{key}"
+
+            candidates.append(
+                {
+                    "size": size,
+                    "bucket": S3_BUCKET,
+                    "prefix": S3_PREFIX,
+                    "load_key": key,
+                    "s3a_path": s3a_path,
+                    "state_key": STATE_KEY,
+                    "part_index": part_index,
+                    "source_etag": etag,
+                    "source_name": SOURCE_NAME,
+                    "batch_id": batch_id,
+                    "loader": "spyt_raw_to_bronze",
+                    "started_at": None,
+                    "finished_at": None,
+                    "load_status": "PENDING",
+                    "rows_inserted": None,
+                    "device_count": None,
+                    "rc": None,
+                    "error": None,
+                }
+            )
+
+            part_index += 1
+
+        return candidates
+
+    @task
+    def submit_spark_job(candidate: dict, batch_id: str) -> dict:
+        started_at = utc_now()
+        command = build_remote_command(candidate, batch_id)
+
+        secret = Variable.get("S3_SECRET_KEY")
+        safe_command = command.replace(secret, "***")
+
+        print(f"SSH ({SSH_CONN_ID}) submit command:")
+        print(safe_command)
+
+        hook = SSHHook(ssh_conn_id=SSH_CONN_ID)
+        client = hook.get_conn()
+
+        stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        rc = stdout.channel.recv_exit_status()
+
+        print("========== REMOTE STDOUT ==========")
+        print(out[-30000:] if out else "<empty>")
+
+        print("========== REMOTE STDERR ==========")
+        print(err[-30000:] if err else "<empty>")
+
+        finished_at = utc_now()
+
+        result = {
+            **candidate,
             "batch_id": batch_id,
-            "loader": LOADER_NAME,
+            "loader": "spyt_raw_to_bronze",
             "started_at": started_at,
-            "finished_at": None,
-            "load_status": None,
+            "finished_at": finished_at,
+            "load_status": "SUCCESS" if rc == 0 else "FAILED",
             "rows_inserted": None,
             "device_count": None,
-            "rc": None,
-            "error": None,
+            "rc": rc,
+            "error": None if rc == 0 else f"spark-submit-yt exit={rc}",
         }
-
-        ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
-        launcher  = Variable.get("GREENHUB_SPARK_LAUNCHER",
-                                   default_var="/home/chig_k3s/main_d/spyt/launch_raw_to_bronze.sh")
-        s3_access = Variable.get("S3_ACCESS_KEY")
-        s3_secret = Variable.get("S3_SECRET_KEY")
-        yt_proxy = Variable.get("YT_PROXY", default_var="http://localhost:31103")
-
-        remote_cmd = (
-            f"BATCH_ID={shlex.quote(batch_id)} "
-            f"S3_ACCESS_KEY={shlex.quote(s3_access)} "
-            f"S3_SECRET_KEY={shlex.quote(s3_secret)} "
-            f"YT_PROXY={shlex.quote(yt_proxy)} "
-            f"YT_USE_HOSTS=0 "
-            f"{shlex.quote(launcher)} "
-            f"{shlex.quote(item['s3a_path'])} {int(item['part_index'])}"
-        )
-
-        logger.info("SSH (%s): %s", ssh_conn_id, remote_cmd[:200])
-
-        try:
-            ssh = SSHHook(ssh_conn_id=ssh_conn_id, conn_timeout=30)
-            with ssh.get_conn() as conn:
-                stdin, stdout, stderr = conn.exec_command(remote_cmd, timeout=3600)
-                rc = stdout.channel.recv_exit_status()
-                out_str = stdout.read().decode("utf-8", errors="replace")
-                err_str = stderr.read().decode("utf-8", errors="replace")
-        except Exception as exc:
-            logger.exception("SSH/spark-submit transport error for %s", item["load_key"])
-            return {
-                **base_result,
-                "load_status": "FAILED_TRANSPORT",
-                "finished_at": now_utc_iso(),
-                "error": repr(exc),
-            }
-
-        rows_inserted = None
-        device_count  = None
-        if (m := ROW_COUNT_RE.search(out_str)):
-            rows_inserted = int(m.group(1).replace(",", ""))
-        if (m := DEVICE_COUNT_RE.search(out_str)):
-            device_count  = int(m.group(1).replace(",", ""))
-
-        logger.info("STDOUT tail (4kb):\n%s", out_str[-4096:] if out_str else "<empty>")
 
         if rc != 0:
-            logger.error("STDERR tail (4kb):\n%s", err_str[-4096:] if err_str else "<empty>")
-            return {
-                **base_result,
-                "load_status": "FAILED",
-                "finished_at": now_utc_iso(),
-                "rc": rc,
-                "rows_inserted": rows_inserted,
-                "device_count": device_count,
-                "error": f"spark-submit-yt exit={rc}; stderr_tail={err_str[-1024:]}",
-            }
+            raise RuntimeError(
+                f"SPYT raw_to_bronze failed with rc={rc}. "
+                f"Check REMOTE STDOUT above; it includes ERROR GREP and full remote log tail."
+            )
 
-        return {
-            **base_result,
-            "load_status": "SUCCESS",
-            "finished_at": now_utc_iso(),
-            "rc": rc,
-            "rows_inserted": rows_inserted,
-            "device_count": device_count,
-            "error": None,
+        return result
+
+    @task
+    def mark_done(results: list[dict]) -> dict:
+        state = load_json_from_s3(S3_BUCKET, STATE_KEY, default={})
+
+        loaded_etags = set(state.get("loaded_etags", []))
+        loaded_files = state.get("loaded_files", [])
+
+        for item in results:
+            if item.get("load_status") != "SUCCESS":
+                continue
+
+            etag = item.get("source_etag")
+            if etag:
+                loaded_etags.add(etag)
+
+            loaded_files.append(
+                {
+                    "bucket": item.get("bucket"),
+                    "key": item.get("load_key"),
+                    "etag": item.get("source_etag"),
+                    "size": item.get("size"),
+                    "batch_id": item.get("batch_id"),
+                    "part_index": item.get("part_index"),
+                    "loaded_at": utc_now(),
+                }
+            )
+
+        new_state = {
+            **state,
+            "source_name": SOURCE_NAME,
+            "bucket": S3_BUCKET,
+            "updated_at": utc_now(),
+            "loaded_etags": sorted(loaded_etags),
+            "loaded_files": loaded_files,
         }
 
-    @task(trigger_rule="none_failed_min_one_success")
-    def mark_done(results: list[dict[str, Any]]) -> None:
-        results = list(results) if results else []
-        if not results:
-            logger.info("No spark results to record")
-            return
+        save_json_to_s3(S3_BUCKET, STATE_KEY, new_state)
 
-        aws_conn = Variable.get("GREENHUB_AWS_CONN_ID", default_var="seaweedfs_s3")
-        s3 = S3Hook(aws_conn_id=aws_conn)
+        return {
+            "loaded_count": len(results),
+            "state_key": STATE_KEY,
+        }
 
-        grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
-        for item in results:
-            key = (item["bucket"], item["source_name"], item.get("prefix") or "", item["state_key"])
-            grouped.setdefault(key, []).append(item)
-
-        for (bucket, source_name, prefix, state_key), group in grouped.items():
-            state = load_json_from_s3(
-                hook=s3,
-                bucket_name=bucket,
-                key=state_key,
-                default=empty_state(source_name, bucket, prefix),
-            )
-            state.setdefault("schema_version", 1)
-            state.setdefault("source_name",    source_name)
-            state.setdefault("bucket",         bucket)
-            state.setdefault("prefix",         prefix)
-            state.setdefault("dataset",        DATASET_TAG)
-            state.setdefault("loader",         LOADER_NAME)
-            state.setdefault("files",          {})
-            state.setdefault("events",         [])
-            state.setdefault("created_at",     now_utc_iso())
-
-            for item in group:
-                load_key = item["load_key"]
-                state["files"][load_key] = {
-                    "load_key": load_key,
-                    "load_status": item.get("load_status"),
-                    "loader": item.get("loader"),
-                    "source_etag": item.get("source_etag"),
-                    "size": item.get("size"),
-                    "part_index": item.get("part_index"),
-                    "started_at": item.get("started_at"),
-                    "finished_at": item.get("finished_at"),
-                    "batch_id": item.get("batch_id"),
-                    "rows_inserted": item.get("rows_inserted"),
-                    "device_count": item.get("device_count"),
-                    "rc": item.get("rc"),
-                    "error": item.get("error"),
-                }
-                state["events"].append({
-                    "event_at": now_utc_iso(),
-                    "load_key": load_key,
-                    "load_status": item.get("load_status"),
-                    "loader": item.get("loader"),
-                    "source_etag": item.get("source_etag"),
-                    "batch_id": item.get("batch_id"),
-                    "rows_inserted": item.get("rows_inserted"),
-                    "error": item.get("error"),
-                })
-
-            state["updated_at"] = now_utc_iso()
-            save_json_to_s3(hook=s3, bucket_name=bucket, key=state_key, data=state)
-            logger.info("State %s/%s: +%d files", bucket, state_key, len(group))
-
-
-    candidates = list_load_candidates()
     batch_id = make_batch_id()
-
-    results = (
-        submit_spark_job
-        .partial(batch_id=batch_id)
-        .expand(item=candidates)
-    )
-
+    candidates = list_load_candidates(batch_id)
+    results = submit_spark_job.expand(candidate=candidates, batch_id=[batch_id])
     mark_done(results)
 
 
-dag = greenhub_s3_to_bronze()
+greenhub_s3_to_bronze()
