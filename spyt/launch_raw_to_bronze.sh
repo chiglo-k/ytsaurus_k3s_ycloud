@@ -1,21 +1,37 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # launch_raw_to_bronze.sh
 # Запуск PySpark job raw_to_bronze_greenhub.py.
-# Аргументы: путь к parquet в S3 + порядковый номер части.
-# Пример (тестовый прогон на одном файле):
-#   ./launch_raw_to_bronze.sh s3a://greenhub//part-0000.parquet 0
-# Пример (с явным batch_id для всей серии загрузок):
-#   BATCH_ID=$(uuidgen) ./launch_raw_to_bronze.sh s3a://greenhub//part-0001.parquet 1
+#
+# Аргументы:
+#   1) путь к parquet в S3, например: s3a://greenhub/part-0000.parquet
+#   2) порядковый номер части, например: 0
+#
+# Пример:
+#   BATCH_ID=$(uuidgen) ./launch_raw_to_bronze.sh s3a://greenhub/part-0000.parquet 0
+#
 # Требования env:
-#   S3_ACCESS_KEY, S3_SECRET_KEY    — креды от SeaweedFS
-#   YT_PROXY=http://localhost:31103, YT_TOKEN=$(cat ~/.yt/token)
+#   S3_ACCESS_KEY, S3_SECRET_KEY
+#   опционально: BATCH_ID, DRIVER_HOST, YT_PROXY, SPARK_LOCAL_IP
+
 set -euo pipefail
+
+
+if [[ -f /home/chig_k3s/yt-env/bin/activate ]]; then
+    source /home/chig_k3s/yt-env/bin/activate
+fi
+
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
+export PATH="$JAVA_HOME/bin:/home/chig_k3s/yt-env/bin:$PATH"
+
+export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-10.130.0.24}"
+
 
 INPUT="${1:?Usage: $0 <s3a-path> <part-index>}"
 PART_INDEX="${2:?Usage: $0 <s3a-path> <part-index>}"
 BATCH_ID="${BATCH_ID:-$(uuidgen)}"
 
 DRIVER_HOST="${DRIVER_HOST:-10.130.0.24}"
+YT_PROXY="${YT_PROXY:-http://localhost:31103}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOB_FILE="$SCRIPT_DIR/raw_to_bronze_greenhub.py"
@@ -30,15 +46,24 @@ if [[ -z "${S3_ACCESS_KEY:-}" ]] || [[ -z "${S3_SECRET_KEY:-}" ]]; then
     exit 1
 fi
 
+if [[ ! -x /home/chig_k3s/yt-env/bin/spark-submit-yt ]]; then
+    echo "ERROR: spark-submit-yt not found or not executable: /home/chig_k3s/yt-env/bin/spark-submit-yt" >&2
+    exit 1
+fi
+
 
 echo "Input: $INPUT"
 echo "Part index: $PART_INDEX"
 echo "Batch ID: $BATCH_ID"
 echo "Driver host: $DRIVER_HOST"
+echo "Spark local IP: $SPARK_LOCAL_IP"
+echo "YT proxy: $YT_PROXY"
 echo "Job file: $JOB_FILE"
+echo "spark-submit-yt: $(command -v spark-submit-yt || true)"
+echo "JAVA_HOME: $JAVA_HOME"
 
 
-spark-submit-yt \
+/home/chig_k3s/yt-env/bin/spark-submit-yt \
   --proxy localhost:31103 \
   --discovery-path //home/spark/discovery/main \
   --packages org.apache.hadoop:hadoop-aws:3.3.4 \
