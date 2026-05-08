@@ -1,36 +1,4 @@
-"""
-greenhub_s3_to_bronze.py
-
-parquet из S3 (SeaweedFS) -> SPYT job -> YT bronze (fact + 12 dim).
-
-  sources_map в Airflow Variable
-  state как JSON в S3 (files + events)
-  detection через etag (skip если SUCCESS && source_etag совпал)
-  dynamic mapping .expand(item=...) - один task на файл
-  pool spyt_pool (размер = количеству SPYT workers в cluster)
-  orchestrator -> executor через SSHHook -> vm1 -> spark-submit-yt -> SPYT
-
-VARIABLES:
-    GREENHUB_S3_SOURCES        JSON: {"greenhub": {"bucket": "greenhub", "prefix": "",
-                                                   "state_key": "_state/greenhub_load.json"}}
-    GREENHUB_AWS_CONN_ID       seaweedfs_s3
-    GREENHUB_SSH_CONN_ID       vm1_ssh
-    GREENHUB_SPARK_LAUNCHER    /home/chig_k3s/main_d/spyt/launch_raw_to_bronze.sh
-    S3_ACCESS_KEY              <SeaweedFS access>
-    S3_SECRET_KEY              <SeaweedFS secret>
-    YT_PROXY                   http://localhost:31103
-
-CONNECTIONS:
-    seaweedfs_s3   AWS-type, endpoint=http://10.130.0.35:8333, key/secret
-    vm1_ssh        SSH-type, host=<vm1 internal IP>, login=chig_k3s,
-                   Extra: {"private_key": "...", "no_host_key_check": true}
-
-POOL:
-    spyt_pool      slots=1 
-"""
-
 #!/usr/bin/env python3
-# greenhub_s3_to_bronze.py
 
 from __future__ import annotations
 
@@ -136,6 +104,8 @@ export S3_ACCESS_KEY={q(s3_access_key)}
 export S3_SECRET_KEY={q(s3_secret_key)}
 export YT_PROXY={q(yt_proxy)}
 export YT_USE_HOSTS=0
+export DRIVER_HOST=10.130.0.24
+export SPARK_LOCAL_IP=10.130.0.24
 
 echo "[AIRFLOW] host=$(hostname)"
 echo "[AIRFLOW] started_at=$(date -Is)"
@@ -156,7 +126,7 @@ echo "[AIRFLOW] full_log={remote_log}"
 
 echo ""
 echo "========== ERROR GREP =========="
-grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot' {q(remote_log)} | head -n 200 || true
+grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsupported|schema|denied|exists|failed|Traceback|Error|Cannot|Initial job has not accepted|Lost executor|Disconnected' {q(remote_log)} | head -n 240 || true
 
 echo ""
 echo "========== FULL LOG TAIL 300 =========="
@@ -206,15 +176,13 @@ def greenhub_s3_to_bronze():
             if etag and etag in loaded_etags:
                 continue
 
-            s3a_path = f"s3a://{S3_BUCKET}/{key}"
-
             candidates.append(
                 {
                     "size": size,
                     "bucket": S3_BUCKET,
                     "prefix": S3_PREFIX,
                     "load_key": key,
-                    "s3a_path": s3a_path,
+                    "s3a_path": f"s3a://{S3_BUCKET}/{key}",
                     "state_key": STATE_KEY,
                     "part_index": part_index,
                     "source_etag": etag,
@@ -235,7 +203,7 @@ def greenhub_s3_to_bronze():
 
         return candidates
 
-    @task
+    @task(pool="spyt_pool")
     def submit_spark_job(candidate: dict, batch_id: str) -> dict:
         started_at = utc_now()
         command = build_remote_command(candidate, batch_id)
@@ -329,7 +297,7 @@ def greenhub_s3_to_bronze():
 
     batch_id = make_batch_id()
     candidates = list_load_candidates(batch_id)
-    results = submit_spark_job.expand(candidate=candidates, batch_id=[batch_id])
+    results = submit_spark_job.partial(batch_id=batch_id).expand(candidate=candidates)
     mark_done(results)
 
 

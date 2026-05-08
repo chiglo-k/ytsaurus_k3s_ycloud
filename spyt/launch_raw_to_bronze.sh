@@ -58,8 +58,11 @@ echo "JAVA_HOME: $JAVA_HOME"
   --proxy localhost:31103 \
   --discovery-path //home/spark/discovery/main \
   --packages org.apache.hadoop:hadoop-aws:3.3.4 \
-  --conf spark.executor.cores=1 \
-  --conf spark.executor.memory=1g \
+  --conf spark.executor.cores=2 \
+  --conf spark.executor.memory=3g \
+  --conf spark.executor.instances=2 \
+  --conf spark.cores.max=4 \
+  --conf spark.driver.memory=2g \
   --conf spark.driver.host="$DRIVER_HOST" \
   --conf spark.driver.bindAddress=0.0.0.0 \
   --conf spark.driver.port=28001 \
@@ -68,6 +71,8 @@ echo "JAVA_HOME: $JAVA_HOME"
   --conf spark.port.maxRetries=32 \
   --conf spark.network.timeout=300s \
   --conf spark.executor.heartbeatInterval=30s \
+  --conf spark.sql.shuffle.partitions=8 \
+  --conf spark.default.parallelism=8 \
   --conf spark.hadoop.fs.s3a.endpoint=http://10.130.0.35:8333 \
   --conf spark.hadoop.fs.s3a.access.key="$S3_ACCESS_KEY" \
   --conf spark.hadoop.fs.s3a.secret.key="$S3_SECRET_KEY" \
