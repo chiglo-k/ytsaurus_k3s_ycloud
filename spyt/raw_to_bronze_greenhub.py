@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+
 PySpark job (запускается на SPYT cluster):
   - Читает один parquet-файл из S3 (SeaweedFS)
   - Генерирует UUIDv5 для всех 12 dim-полей по namespace из docs/uuid_namespaces.py
@@ -16,6 +17,7 @@ PySpark job (запускается на SPYT cluster):
       --input s3a://greenhub//part-0000.parquet \\
       --batch-id $(uuidgen) \\
       --part-index 0
+
 """
 
 import argparse
@@ -26,6 +28,10 @@ import uuid
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
+
+
+def yt_table_path(path: str) -> str:
+    return "ytTable:" + path.removeprefix("/")
 
 
 NS_FACT_TELEMETRY = uuid.UUID("8947f476-fb93-44bc-aec6-2b8199d66c77")
@@ -46,7 +52,7 @@ NS_WIFI_STATUS = uuid.UUID("b78bd936-71ed-483a-ad3f-eab9eb57f9e3")
 
 def make_uid_udf(ns: uuid.UUID):
     """Возвращает Spark UDF, генерящий UUIDv5 от raw_value в указанном namespace.
-    None / "" / NaN uuid5(ns, "__null__"), чтобы NULL стал явной dim-записью."""
+    None / "" / NaN → uuid5(ns, "__null__"), чтобы NULL стал явной dim-записью."""
     ns_local = ns
     def _f(value):
         if value is None:
@@ -60,22 +66,19 @@ def make_uid_udf(ns: uuid.UUID):
 
 @F.udf(StringType())
 def fact_uid_udf(source_id, device_id, ts):
+    """fact_uid = uuid5(NS_FACT, '<source_id>|<device_id>|<ts_iso>')"""
     if source_id is None or device_id is None or ts is None:
         return None
     natural_key = f"{int(source_id)}|{int(device_id)}|{ts.isoformat()}"
     return str(uuid.uuid5(NS_FACT_TELEMETRY, natural_key))
 
 def double_to_bool(col_name):
+    """double 0.0/1.0/NaN → boolean false/true/null."""
     return (
         F.when(F.col(col_name).isNull(), F.lit(None).cast("boolean"))
          .when(F.col(col_name) == 0.0, F.lit(False))
          .otherwise(F.lit(True))
     ).alias(col_name)
-
-
-def yt_table_path(path: str) -> str:
-    normalized = "/" + path.lstrip("/")
-    return f"ytTable:{normalized}"
 
 
 def main():
@@ -93,10 +96,7 @@ def main():
 
     print(f"[INFO] Reading {args.input}")
     df_raw = spark.read.parquet(args.input)
-
-    if "timestamp" in df_raw.columns:
-        df_raw = df_raw.withColumn("timestamp", F.col("timestamp").cast("timestamp"))
-
+    df_raw = df_raw.withColumn("timestamp", F.col("timestamp").cast("timestamp"))
     df_raw = df_raw.cache()
     rows_in = df_raw.count()
     print(f"[INFO] Source rows: {rows_in:,}")
@@ -132,6 +132,7 @@ def main():
         .withColumn("mobile_network_type_uid", uid_mobnettype(F.col("mobile_network_type")))
         .withColumn("mobile_data_status_uid", uid_mobdatastat(F.col("mobile_data_status")))
         .withColumn("mobile_data_activity_uid", uid_mobdataact(F.col("mobile_data_activity")))
+        .withColumn("wifi_status_uid", uid_wifistatus(F.col("wifi_status")))
         .withColumn("screen_on", (F.col("screen_on") == 1).cast("boolean"))
         .withColumn("roaming_enabled", F.when(F.col("roaming_enabled").isNull(),     F.lit(None).cast("boolean")).when(F.col("roaming_enabled")     == 0.0, F.lit(False)).otherwise(F.lit(True)))
         .withColumn("bluetooth_enabled", F.when(F.col("bluetooth_enabled").isNull(),   F.lit(None).cast("boolean")).when(F.col("bluetooth_enabled")   == 0.0, F.lit(False)).otherwise(F.lit(True)))
