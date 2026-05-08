@@ -17,11 +17,14 @@ SILVER_PATH = "//home/silver_stage/greenhub_telemetry"
 def yt_table_path(path: str) -> str:
     if path.startswith("ytTable:"):
         return path
+
     if path.startswith("//"):
-        return "ytTable:" + path[1:]
+        return "ytTable:/" + path
+
     if path.startswith("/"):
-        return "ytTable:" + path
-    return "ytTable:/" + path
+        return "ytTable:///" + path.lstrip("/")
+
+    return "ytTable:///" + path
 
 
 def read_yt(spark: SparkSession, path: str):
