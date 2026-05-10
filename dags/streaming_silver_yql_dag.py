@@ -12,7 +12,16 @@ REPO_ROOT = "/opt/airflow/dags/repo"
 SCRIPT = f"{REPO_ROOT}/scripts/run_yql_with_yt_log.sh"
 SQL_DIR = f"{REPO_ROOT}/sql/streaming_silver"
 
-YT_PROXY = "http://81.26.182.40:31103"
+YT_PROXY = "http://localhost:31103"
+
+YT_PATH = (
+    "/home/airflow/.local/bin:"
+    "/opt/airflow/.local/bin:"
+    "/home/chig_k3s/yt-env/bin:"
+    "/usr/local/bin:"
+    "/usr/bin:"
+    "/bin"
+)
 
 
 def yql_task(task_id: str, sql_file: str, target_table: str) -> BashOperator:
@@ -20,10 +29,24 @@ def yql_task(task_id: str, sql_file: str, target_table: str) -> BashOperator:
         task_id=task_id,
         env={
             "YT_PROXY": YT_PROXY,
+            "PATH": YT_PATH,
         },
         bash_command=f"""
 bash -lc '
 set -euo pipefail
+
+export PATH="{YT_PATH}:$PATH"
+export YT_PROXY="{YT_PROXY}"
+
+echo "DAG_ID={DAG_ID}"
+echo "TASK_ID={task_id}"
+echo "SQL_FILE={SQL_DIR}/{sql_file}"
+echo "TARGET_TABLE={target_table}"
+echo "YT_PROXY=$YT_PROXY"
+
+echo "== check yt cli =="
+command -v yt
+yt --version || true
 
 export RUN_ID="{{{{ run_id }}}}"
 export DAG_ID="{{{{ dag.dag_id }}}}"
