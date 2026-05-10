@@ -30,7 +30,7 @@ with DAG(
     description="Build streaming silver tables from bronze_stage using YQL",
     default_args=default_args,
     start_date=datetime(2026, 5, 10),
-    schedule_interval="*/5 * * * *",
+    schedule="*/5 * * * *",
     catchup=False,
     max_active_runs=1,
     tags=["ytsaurus", "yql", "streaming", "silver"],
