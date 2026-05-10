@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-streaming_silver_yql_dag.py
-
-DAG: bronze streaming tables -> silver streaming tables через YQL.
-
-Airflow -> SSH vm1 -> bash run_yql_with_yt_log.sh.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -16,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 try:
-    from airflow.sdk import dag, task
+    from airflow.sdk import dag, task, Variable
 except ImportError:
     from airflow.decorators import dag, task
+    from airflow.models import Variable
 
-from airflow.models import Variable
 from airflow.providers.ssh.hooks.ssh import SSHHook
 
 
@@ -30,22 +22,26 @@ DAG_ID = "streaming_silver_yql"
 DATASET_TAG = "jsonplaceholder_streaming"
 LOADER_NAME = "yql_streaming_silver"
 
+REMOTE_REPO_ROOT = "/home/chig_k3s/git/repo"
+REMOTE_SCRIPT = f"{REMOTE_REPO_ROOT}/scripts/run_yql_with_yt_log.sh"
+REMOTE_SQL_DIR = f"{REMOTE_REPO_ROOT}/sql/streaming_silver"
+
 REMOTE_LOG_DIR = "/home/chig_k3s/main_d/logs/airflow_streaming_silver"
 
 STREAMING_TABLES = [
     {
         "task_name": "streaming_posts",
-        "sql_file": "/home/chig_k3s/main_d/sql/streaming_silver/streaming_posts.sql",
+        "sql_file": f"{REMOTE_SQL_DIR}/streaming_posts.sql",
         "target_table": "//home/silver_stage/streaming_posts",
     },
     {
         "task_name": "streaming_comments",
-        "sql_file": "/home/chig_k3s/main_d/sql/streaming_silver/streaming_comments.sql",
+        "sql_file": f"{REMOTE_SQL_DIR}/streaming_comments.sql",
         "target_table": "//home/silver_stage/streaming_comments",
     },
     {
         "task_name": "streaming_todos",
-        "sql_file": "/home/chig_k3s/main_d/sql/streaming_silver/streaming_todos.sql",
+        "sql_file": f"{REMOTE_SQL_DIR}/streaming_todos.sql",
         "target_table": "//home/silver_stage/streaming_todos",
     },
 ]
@@ -66,9 +62,9 @@ def safe_name(value: str) -> str:
 def build_remote_command(item: dict[str, str], batch_id: str) -> str:
     launcher = Variable.get(
         "STREAMING_SILVER_YQL_LAUNCHER",
-        default_var="/home/chig_k3s/main_d/scripts/run_yql_with_yt_log.sh",
+        default=REMOTE_SCRIPT,
     )
-    yt_proxy = Variable.get("YT_PROXY", default_var="http://localhost:31103")
+    yt_proxy = Variable.get("YT_PROXY", default="http://localhost:31103")
 
     task_name = item["task_name"]
     sql_file = item["sql_file"]
@@ -93,7 +89,6 @@ export TARGET_TABLE={q(target_table)}
 
 export YT_PROXY={q(yt_proxy)}
 export YT_USE_HOSTS=0
-
 export PATH="/home/chig_k3s/yt-env/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 echo "[AIRFLOW] host=$(hostname)"
@@ -108,11 +103,13 @@ echo "[AIRFLOW] yt_proxy=$YT_PROXY"
 echo "[AIRFLOW] full_log={remote_log}"
 
 echo ""
-echo "========== CHECKS =========="
+echo "CHECKS"
 whoami || true
 pwd || true
 command -v yt || true
 yt --version || true
+ls -lah {q(launcher)}
+ls -lah {q(sql_file)}
 test -f {q(sql_file)}
 test -f {q(launcher)}
 
@@ -131,7 +128,7 @@ echo "ERROR GREP"
 grep -n -Ei 'Exception|Traceback|Error|failed|FAILED|denied|Cannot|YtError|YQL|syntax|Type annotation|not found|No such file|permission|timeout|aborted' {q(remote_log)} | head -n 240 || true
 
 echo ""
-echo "DONE GREP "
+echo "DONE GREP"
 grep -n -Ei '\\[DONE\\]|SUCCESS|completed|insert|rows|target|silver|query' {q(remote_log)} | head -n 240 || true
 
 echo ""
@@ -176,7 +173,7 @@ def streaming_silver_yql():
     def submit_streaming_silver(item: dict[str, str], batch_id: str) -> dict[str, Any]:
         started_at = now_utc_iso()
 
-        ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
+        ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default="vm1_ssh")
         command = build_remote_command(item, batch_id)
 
         task_name = item["task_name"]
@@ -216,7 +213,7 @@ def streaming_silver_yql():
         print(f"REMOTE STDOUT task={task_name}")
         print(out_str[-30000:] if out_str else "<empty>")
 
-        print(f"REMOTE STDERR task={task_name} ")
+        print(f"REMOTE STDERR task={task_name}")
         print(err_str[-30000:] if err_str else "<empty>")
 
         finished_at = now_utc_iso()
@@ -237,11 +234,6 @@ def streaming_silver_yql():
 
     @task(trigger_rule="none_failed_min_one_success")
     def print_summary(results: list[dict[str, Any]]) -> None:
-        if not results:
-            logger.info("No streaming silver runs to summarize")
-            return
-
-        logger.info("Streaming silver summary:")
         for item in results:
             logger.info(
                 "task=%s status=%s target=%s batch_id=%s rc=%s",
