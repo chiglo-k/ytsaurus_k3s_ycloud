@@ -15,6 +15,7 @@ LOG_ROOT="//home/ops_logs/airflow"
 LOG_TABLE="${LOG_ROOT}/streaming_silver_runs"
 
 START_TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+START_EPOCH="$(date +%s)"
 TMP_LOG="$(mktemp /tmp/streaming_silver_yql.XXXXXX.log)"
 
 STATUS="success"
@@ -56,8 +57,6 @@ yt create table "${LOG_TABLE}" \
     ];
   }' || true
 
-START_EPOCH="$(date +%s)"
-
 echo "[INFO] run YQL"
 set +e
 yt query --format json yql "$(cat "${SQL_FILE}")" > "${TMP_LOG}" 2>&1
@@ -77,7 +76,7 @@ DURATION_SEC="$((END_EPOCH - START_EPOCH))"
 
 echo "[INFO] write run log to ${LOG_TABLE}"
 
-python3 - "${TMP_LOG}" <<PY | yt write-table --append "${LOG_TABLE}" --format json
+python3 - "${TMP_LOG}" <<PY | yt write-table --format json "<append=%true>${LOG_TABLE}"
 import json
 import sys
 from pathlib import Path
