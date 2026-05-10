@@ -1,0 +1,17 @@
+cd /home/chig_k3s/main_d/consumers
+mkdir -p /home/chig_k3s/main_d/logs
+
+export YT_PROXY=http://localhost:31103
+export KAFKA_BOOTSTRAP_SERVERS=10.130.0.27:30092
+export KAFKA_TOPIC=raw-events
+export KAFKA_GROUP_ID=raw-consumer-v1
+export POLL_SECONDS=30
+
+nohup /home/chig_k3s/yt-env/bin/python api_to_kafka.py \
+  > /home/chig_k3s/main_d/logs/api_to_kafka.log 2>&1 &
+
+nohup /home/chig_k3s/yt-env/bin/python kafka_to_raw.py \
+  > /home/chig_k3s/main_d/logs/kafka_to_raw.log 2>&1 &
+
+nohup /home/chig_k3s/yt-env/bin/python raw_to_bronze.py \
+  > /home/chig_k3s/main_d/logs/raw_to_bronze.log 2>&1 &

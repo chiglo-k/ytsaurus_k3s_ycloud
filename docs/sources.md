@@ -1126,3 +1126,151 @@ export YT_PROXY=http://localhost:31103
 export YT_USE_HOSTS=0
 python3 ~/main_d/consumers/kafka_to_raw.py
 ```
+
+
+2 exec nod
+
+CHYT -- чтобы пошел (расход ресурсов..)
+```
+kubectl patch ytsaurus minisaurus -n default --type=json -p='[
+  {"op": "replace", "path": "/spec/execNodes/0/instanceCount", "value": 2}
+]'
+```
+
+```
+yt unmount-table //home/raw_stage/raw_events --force
+sleep 5
+yt get //home/raw_stage/raw_events/@tablet_state    # должен стать unmounted
+
+# 2. Reshard можно делать только на unmounted, иначе все встанет 
+yt reshard-table //home/raw_stage/raw_events --tablet-count 6
+
+# 3. Mount
+yt mount-table //home/raw_stage/raw_events
+
+# 4. Проверка
+yt get //home/raw_stage/raw_events/@tablet_state    # = "mounted"
+yt get //home/raw_stage/raw_events/@tablet_count    # = 6
+bashyt get //home/raw_stage/raw_events/@tablets --format json 2>/dev/null \
+  | python3 -c "import json,sys; t=json.load(sys.stdin); [print(i, ti.get('cell_id','?')[-12:]) for i,ti in enumerate(t)]"
+```
+
+# 1 CHYT
+TOKEN=$(curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:ytsaurus/chyt:pull" | sed 's/.*"token":"\([^"]*\)".*/\1/')
+curl -s -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/ytsaurus/chyt/tags/list" | python3 -m json.tool
+mkdir -p ~/git/repo/k8s
+cat > ~/git/repo/k8s/chyt.yaml <<'EOF'
+apiVersion: cluster.ytsaurus.tech/v1
+kind: Chyt
+metadata:
+  name: minisaurus-chyt
+  namespace: default
+spec:
+  ytsaurus:
+    name: minisaurus
+  image: ghcr.io/ytsaurus/chyt:2.16.0     # ← подставь актуальный
+  makeDefault: true
+EOF
+
+kubectl apply -f ~/git/repo/k8s/chyt.yaml
+
+watch 'kubectl get chyt -n default; echo ---; kubectl get pods -n default | grep -iE "chyt|operation"
+yt query --engine chyt 'SELECT count(*) FROM "//home/bronze_stage/greenhub/fact_telemetry"'
+yt query --engine chyt 'SELECT * FROM "//home/gold_stage/gold_country_overview" LIMIT
+
+#ACL CHYT
+yt exists //sys/access_control_object_namespaces/chyt
+yt list //sys/access_control_object_namespaces || true
+
+yt create access_control_object_namespace //sys/access_control_object_namespaces/chyt --ignore-existing || true
+
+yt create access_control_object //sys/access_control_object_namespaces/chyt/ch_public --ignore-existing || true
+
+yt create \
+  --type access_control_object \
+  --path //sys/access_control_object_namespaces/chyt/ch_public \
+  --attributes '{name=ch_public;namespace=chyt;}' \
+  --ignore-existing
+
+
+yt exists //sys/access_control_object_namespaces/chyt/ch_public
+yt get //sys/access_control_object_namespaces/chyt/ch_public/@
+
+yt set //sys/access_control_object_namespaces/chyt/ch_public/@acl '[
+  {
+    action=allow;
+    subjects=[everyone];
+    permissions=[read;use];
+  }
+]'
+
+kubectl get pod -n default | grep -i chyt
+
+kubectl get job -n default | grep -i chyt
+
+kubectl logs -n default job/yt-chyt-minisaurus-chyt-init-job-release --tail=200
+
+kubectl logs -n default job/yt-chyt-minisaurus-chyt-init-job-user --tail=200
+kubectl exec -n default deploy/strawberry-controller -- sh -lc '
+cat > /tmp/chyt_public.yson <<EOF
+{
+    pool = "research";
+    instance_count = 1;
+    cpu_limit = 2;
+    memory_limit = 4294967296;
+}
+EOF
+
+export YT_PROXY=http-proxies-lb.default.svc.cluster.local
+
+/usr/bin/chyt-controller one-shot-run \
+  --config-path /config/strawberry-controller.yson \
+  --log-to-stderr \
+  --family chyt \
+  --alias ch_public \
+  --speclet-path /tmp/chyt_public.yson
+'
+
+yt remove //sys/clickhouse/strawberry/ch_public/speclet/instance_cpu 2>/dev/null || true
+yt remove //sys/clickhouse/strawberry/ch_public/speclet/instance_total_memory 2>/dev/null || true
+
+# 2. Перевести stage в production (чтобы controller сам поднимал operations)
+yt set //sys/clickhouse/strawberry/ch_public/speclet/stage '"production"'
+
+# 3. Проверить текущий speclet
+yt get //sys/clickhouse/strawberry/ch_public/speclet --format json | python3 -m json.tool
+
+# 4. Abort failed operation — controller увидит нет op и создаст новую
+OP=$(yt get //sys/clickhouse/strawberry/ch_public/@strawberry_persistent_state/yt_operation_id 2>/dev/null | tr -d '"')
+echo "Current OP: $OP"
+yt abort-op "$OP" 2>/dev/null || echo "abort failed (op already finished?)"
+
+# 5. Подождать пока strawberry-controller создаст новую operation
+sleep 30
+
+NEW_OP=$(yt get //sys/clickhouse/strawberry/ch_public/@strawberry_persistent_state/yt_operation_id 2>/dev/null | tr -d '"')
+echo "New OP: $NEW_OP"
+yt get-operation "$NEW_OP" 2>/dev/null | grep -E '"state"|cpu_limit|memory_limit|insufficient|enough' | head -10
+
+# Configmap — может там зашиты defaults
+kubectl get configmap yt-strawberry-controller-config -n default -o yaml | head -80
+
+# Logs controller'а — что он делает по поводу ch_public
+POD=$(kubectl get pod -n default | grep strawberry | awk '{print $1}')
+echo "Pod: $POD"
+kubectl logs -n default "$POD" --tail=100 | grep -iE "ch_public|operation|cpu|error" | tail -40
+
+
+# 1. Что в //sys/strawberry (туда смотрит controller)
+yt list //sys/strawberry 2>/dev/null
+yt list //sys/strawberry/chyt 2>/dev/null
+
+# 2. Если ch_public там — глянуть speclet
+yt get //sys/strawberry/chyt/ch_public/speclet --format json 2>/dev/null | python3 -m json.tool
+
+
+yt create map_node //home/silver_stage --ignore-existing
+
+yt create table //home/silver_stage/streaming_posts --ignore-existing
+yt create table //home/silver_stage/streaming_comments --ignore-existing
+yt create table //home/silver_stage/streaming_users --ignore-existing
