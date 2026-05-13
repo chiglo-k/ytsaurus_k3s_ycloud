@@ -57,6 +57,47 @@ def stable_uuid_from_value(namespace: str, col_expr):
     )
 
 
+
+
+def try_read_yt_table(spark: SparkSession, path: str):
+    try:
+        return spark.read.format("yt").load(yt_table_path(path))
+    except Exception as exc:  # table may be absent on first bootstrap
+        print(f"[WARN] cannot read existing YT table {path}: {exc!r}; treating as empty", flush=True)
+        return None
+
+
+def append_only_new_rows(df, spark: SparkSession, path: str, key_cols: list[str], label: str) -> int:
+    """Append only rows whose business key is absent in the target YT table."""
+    candidate_count = df.count()
+    existing = try_read_yt_table(spark, path)
+
+    if existing is not None:
+        existing_keys = existing.select(*key_cols).dropDuplicates(key_cols)
+        df_new = df.join(existing_keys, on=key_cols, how="left_anti")
+    else:
+        df_new = df
+
+    new_count = df_new.count()
+    skipped_count = candidate_count - new_count
+    print(
+        f"[INFO] {label}: candidates={candidate_count:,}, new={new_count:,}, skipped_existing={skipped_count:,}",
+        flush=True,
+    )
+
+    if new_count > 0:
+        (
+            df_new.write
+            .format("yt")
+            .mode("append")
+            .save(yt_table_path(path))
+        )
+        print(f"[INFO] {label}: appended {new_count:,} rows", flush=True)
+    else:
+        print(f"[INFO] {label}: nothing to append", flush=True)
+
+    return new_count
+
 def to_bool(col_name: str):
     return (
         F.when(F.col(col_name).isNull(), F.lit(None).cast("boolean"))
@@ -244,17 +285,13 @@ def main() -> int:
         )
 
         path = f"{args.bronze_root}/dim_{dim_name}"
-        n = df_dim.count()
-        print(f"[INFO] dim_{dim_name} ({n} distinct rows) -> {path}", flush=True)
-
-        (
-            df_dim.write
-            .format("yt")
-            .mode("append")
-            .save(yt_table_path(path))
+        append_only_new_rows(
+            df_dim,
+            spark,
+            path,
+            [f"{dim_name}_uid"],
+            f"dim_{dim_name}",
         )
-
-        print(f"[INFO] dim_{dim_name} written", flush=True)
 
     df_dim_device = (
         df_raw
@@ -266,17 +303,13 @@ def main() -> int:
     )
 
     path = f"{args.bronze_root}/dim_device"
-    n_dev = df_dim_device.count()
-    print(f"[INFO] dim_device ({n_dev} distinct devices) -> {path}", flush=True)
-
-    (
-        df_dim_device.write
-        .format("yt")
-        .mode("append")
-        .save(yt_table_path(path))
+    n_dev = append_only_new_rows(
+        df_dim_device,
+        spark,
+        path,
+        ["device_uid"],
+        "dim_device",
     )
-
-    print("[INFO] dim_device written", flush=True)
 
     print(f"[DONE] batch_id    : {args.batch_id}", flush=True)
     print(f"[DONE] part_index  : {args.part_index}", flush=True)

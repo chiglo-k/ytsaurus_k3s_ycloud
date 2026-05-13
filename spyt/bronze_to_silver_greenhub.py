@@ -31,6 +31,15 @@ def read_yt(spark: SparkSession, path: str):
     return spark.read.format("yt").load(yt_table_path(path))
 
 
+
+
+def try_read_yt(spark: SparkSession, path: str):
+    try:
+        return read_yt(spark, path)
+    except Exception as exc:
+        print(f"[WARN] cannot read existing YT table {path}: {exc!r}; treating as empty", flush=True)
+        return None
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-id", required=True)
@@ -68,6 +77,22 @@ def main() -> int:
         flush=True,
     )
 
+    existing_silver = try_read_yt(spark, args.silver_path)
+    if existing_silver is not None:
+        existing_silver_keys = existing_silver.select("fact_uid").dropDuplicates(["fact_uid"])
+        existing_silver_count = existing_silver_keys.count()
+        fact_new = fact_dedup.join(existing_silver_keys, on="fact_uid", how="left_anti")
+    else:
+        existing_silver_count = 0
+        fact_new = fact_dedup
+
+    fact_new_count = fact_new.count()
+    print(
+        f"[INFO] silver append candidates: {fact_new_count:,} "
+        f"(existing silver fact_uid={existing_silver_count:,})",
+        flush=True,
+    )
+
     def read_dim(name: str, value_col_alias: str):
         return (
             read_yt(spark, f"{args.bronze_root}/dim_{name}")
@@ -100,7 +125,7 @@ def main() -> int:
     )
 
     silver = (
-        fact_dedup
+        fact_new
         .join(dim_device, F.col("device_uid") == F.col("_join_device_uid"), "left").drop("_join_device_uid")
         .join(dim_country, F.col("country_uid") == F.col("_join_country_uid"), "left").drop("_join_country_uid")
         .join(dim_timezone, F.col("timezone_uid") == F.col("_join_timezone_uid"), "left").drop("_join_timezone_uid")
@@ -206,13 +231,16 @@ def main() -> int:
     silver_count = silver_out.count()
     print(f"[INFO] silver wide rows: {silver_count:,}", flush=True)
 
-    print(f"[INFO] writing silver -> {yt_table_path(args.silver_path)}", flush=True)
-    (
-        silver_out.write
-        .format("yt")
-        .mode("overwrite")
-        .save(yt_table_path(args.silver_path))
-    )
+    if silver_count > 0:
+        print(f"[INFO] appending silver -> {yt_table_path(args.silver_path)}", flush=True)
+        (
+            silver_out.write
+            .format("yt")
+            .mode("append")
+            .save(yt_table_path(args.silver_path))
+        )
+    else:
+        print(f"[INFO] no new silver rows to append -> {yt_table_path(args.silver_path)}", flush=True)
 
     print(f"[DONE] batch_id        : {args.batch_id}", flush=True)
     print(f"[DONE] bronze fact in  : {fact_count_in:,}", flush=True)

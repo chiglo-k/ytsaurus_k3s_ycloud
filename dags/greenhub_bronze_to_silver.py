@@ -27,6 +27,12 @@ from airflow.models import Variable
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.ssh.hooks.ssh import SSHHook
 
+try:
+    from airflow.operators.python import get_current_context
+except ImportError:  # pragma: no cover
+    def get_current_context() -> dict:
+        return {}
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,9 @@ ROW_DEDUP_RE = re.compile(r"\[DONE\]\s+after dedup\s*:\s*([\d,]+)")
 ROW_OUT_RE = re.compile(r"\[DONE\]\s+silver out\s*:\s*([\d,]+)")
 
 REMOTE_LOG_DIR = "/home/chig_k3s/git/spyt-logs"
+OPS_LOG_ROOT = "//home/ops_logs/greenhub"
+S3_LOG_PREFIX = "_logs/greenhub"
+DEFAULT_YT_PROXY = "http://localhost:31103"
 
 
 def now_utc_iso() -> str:
@@ -75,6 +84,74 @@ def save_json_to_s3(hook: S3Hook, bucket_name: str, key: str, data: Any) -> None
     hook.load_bytes(bytes_data=payload, bucket_name=bucket_name, key=key, replace=True)
 
 
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def duration_seconds(started_at: str | None, finished_at: str | None) -> float | None:
+    start = parse_iso(started_at)
+    finish = parse_iso(finished_at)
+    if not start or not finish:
+        return None
+    return max((finish - start).total_seconds(), 0.0)
+
+
+def bronze_silver_remote_log_path(batch_id: str) -> str:
+    return f"{REMOTE_LOG_DIR}/bronze_to_silver_{safe_name(batch_id)}.log"
+
+
+def current_run_id() -> str | None:
+    try:
+        context = get_current_context()
+    except Exception:
+        return None
+    return context.get("run_id")
+
+
+def save_run_json_log_to_s3(s3: S3Hook, bucket: str, category: str, batch_id: str, payload: dict[str, Any]) -> str:
+    key = f"{S3_LOG_PREFIX}/{category}/{safe_name(batch_id)}.json"
+    save_json_to_s3(s3, bucket, key, payload)
+    return key
+
+
+def write_json_rows_to_yt(table_path: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    yt_proxy = Variable.get("YT_PROXY", default_var=DEFAULT_YT_PROXY)
+    ssh_conn_id = Variable.get("GREENHUB_SSH_CONN_ID", default_var="vm1_ssh")
+    payload = "\n".join(json.dumps(row, ensure_ascii=False, default=str) for row in rows)
+
+    command = f"""
+set -euo pipefail
+export YT_PROXY={q(yt_proxy)}
+export YT_USE_HOSTS=0
+export PATH="/home/chig_k3s/yt-env/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+cat <<'JSONL' | yt write-table --format json {q(f'<append=%true>{table_path}')}
+{payload}
+JSONL
+""".strip()
+
+    ssh = SSHHook(ssh_conn_id=ssh_conn_id, conn_timeout=30)
+    with ssh.get_conn() as conn:
+        stdin, stdout, stderr = conn.exec_command(command, get_pty=True, timeout=120)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        rc = stdout.channel.recv_exit_status()
+
+    if out:
+        print(out[-12000:])
+    if err:
+        print(err[-12000:])
+    if rc != 0:
+        raise RuntimeError(f"Failed to write YT log table {table_path}: rc={rc}")
+
+
 def empty_silver_state() -> dict[str, Any]:
     now = now_utc_iso()
     return {
@@ -95,7 +172,7 @@ def build_remote_command(batch_id: str) -> str:
     )
     yt_proxy = Variable.get("YT_PROXY", default_var="http://localhost:31103")
 
-    remote_log = f"{REMOTE_LOG_DIR}/bronze_to_silver_{safe_name(batch_id)}.log"
+    remote_log = bronze_silver_remote_log_path(batch_id)
 
     return f"""
 set -u
@@ -129,7 +206,7 @@ grep -n -Ei 'AnalysisException|Py4JJavaError|Exception|Caused by|YtError|Yt|Unsu
 
 echo ""
 echo "========== DONE GREP =========="
-grep -n -Ei '\\[DONE\\]|\\[INFO\\] bronze fact rows|\\[INFO\\] silver wide rows|writing silver' {q(remote_log)} || true
+grep -n -Ei '\\[DONE\\]|\\[INFO\\] bronze fact rows|\\[INFO\\] silver wide rows|silver append candidates|appending silver|no new silver' {q(remote_log)} || true
 
 echo ""
 echo "========== FULL LOG TAIL 300 =========="
@@ -184,6 +261,8 @@ def greenhub_bronze_to_silver():
             "rows_bronze_in": None,
             "rows_after_dedup": None,
             "rows_silver_out": None,
+            "target_table": "//home/silver_stage/greenhub_telemetry",
+            "remote_log": bronze_silver_remote_log_path(batch_id),
             "error": None,
         }
 
@@ -218,21 +297,15 @@ def greenhub_bronze_to_silver():
 
         finished_at = now_utc_iso()
 
-        if rc != 0:
-            raise RuntimeError(
-                f"SPYT bronze_to_silver failed with rc={rc}. "
-                f"Check REMOTE STDOUT above; it includes ERROR GREP and full remote log tail."
-            )
-
         return {
             **result,
-            "load_status": "SUCCESS",
+            "load_status": "SUCCESS" if rc == 0 else "FAILED",
             "finished_at": finished_at,
             "rc": rc,
-            "error": None,
+            "error": None if rc == 0 else f"spark-submit-yt exit={rc}",
         }
 
-    @task(trigger_rule="none_failed_min_one_success")
+    @task(trigger_rule="all_done")
     def mark_silver_run(result: dict[str, Any]) -> None:
         if not result:
             logger.info("No silver run to record")
@@ -251,15 +324,24 @@ def greenhub_bronze_to_silver():
 
         event = {
             "event_at": now_utc_iso(),
+            "dag_id": "greenhub_bronze_to_silver",
+            "run_id": current_run_id(),
             "batch_id": result.get("batch_id"),
+            "loader": LOADER_NAME,
+            "source_layer": "bronze",
+            "target_layer": "silver",
+            "target_table": result.get("target_table") or "//home/silver_stage/greenhub_telemetry",
             "load_status": result.get("load_status"),
+            "started_at": result.get("started_at"),
+            "finished_at": result.get("finished_at"),
+            "duration_sec": duration_seconds(result.get("started_at"), result.get("finished_at")),
             "rows_bronze_in": result.get("rows_bronze_in"),
             "rows_after_dedup": result.get("rows_after_dedup"),
             "rows_silver_out": result.get("rows_silver_out"),
-            "started_at": result.get("started_at"),
-            "finished_at": result.get("finished_at"),
             "rc": result.get("rc"),
             "error": result.get("error"),
+            "remote_log": result.get("remote_log"),
+            "message": None,
         }
         state["events"].append(event)
 
@@ -272,7 +354,21 @@ def greenhub_bronze_to_silver():
 
         state["updated_at"] = now_utc_iso()
         save_json_to_s3(s3, bucket, state_key, state)
-        logger.info("Silver state %s/%s updated", bucket, state_key)
+
+        log_key = save_run_json_log_to_s3(
+            s3,
+            bucket,
+            "layer_runs",
+            result.get("batch_id") or _uuid.uuid4().hex,
+            {"layer_run": event},
+        )
+        event["message"] = f"state_key={state_key}; s3_log_key={log_key}"
+        write_json_rows_to_yt(f"{OPS_LOG_ROOT}/layer_runs", [event])
+
+        logger.info("Silver state %s/%s updated; log=%s", bucket, state_key, log_key)
+
+        if result.get("load_status") != "SUCCESS":
+            raise RuntimeError("SPYT bronze_to_silver failed. Logs were written to S3 and YTsaurus.")
 
     batch_id = make_batch_id()
     result = submit_bronze_to_silver(batch_id)
