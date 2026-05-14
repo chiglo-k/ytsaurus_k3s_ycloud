@@ -406,7 +406,7 @@ export YT_TOKEN=$(cat ~/.yt/token)
 yt list / 2>&1 | head -10 # externIP:30254 у меня здесь.
 ```
 
-###### Cypress тест
+##### Cypress тест
 
 ```python
 for d in raw_stage bronze_stage silver_stage gold_stage ops_logs ops_logs/greenhub bronze_stage/greenhub; do
@@ -417,6 +417,22 @@ yt list //home
 yt list //home/ops_logs
 ```
 
+### Создать таблицы
 
+```bash
+
+bash script_table.sh
+yt list //home/bronze_stage/greenhub
+
+bash create_silver_tables.sh
+yt list //home/silver_stage
+
+bash create_gold_tables.sh
+yt list //home/gold_stage
+
+bash silver_kafka.txt
+yt list //home/silver_stage
+
+```
 
 
