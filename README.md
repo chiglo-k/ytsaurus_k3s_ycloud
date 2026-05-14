@@ -434,5 +434,95 @@ bash silver_kafka.txt
 yt list //home/silver_stage
 
 ```
+## Kafka
 
+```yaml
+mkdir -p ~/helm-values
+
+cat > ~/helm-values/kafka.yaml <<'EOF'
+broker:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+  persistence:
+    enabled: true
+    size: 20Gi
+  replicaCount: 1
+controller:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+  persistence:
+    enabled: true
+    size: 8Gi
+  replicaCount: 1
+externalAccess:
+  broker:
+    service:
+      externalIPs:
+      - 10.130.0.27
+      nodePorts:
+      - 30092
+      type: NodePort
+  controller:
+    forceExpose: false
+    service:
+      loadBalancerIPs:
+      - 10.130.0.27
+      type: LoadBalancer
+  enabled: true
+image:
+  registry: docker.io
+  repository: bitnamilegacy/kafka
+  tag: 4.0.0-debian-12-r10
+kraft:
+  enabled: true
+listeners:
+  client:
+    protocol: PLAINTEXT
+  controller:
+    protocol: PLAINTEXT
+  external:
+    protocol: PLAINTEXT
+  interbroker:
+    protocol: PLAINTEXT
+zookeeper:
+  enabled: false
+EOF
+
+cat > ~/helm-values/kafka-ui.yaml <<'EOF'
+nodeSelector:
+  kubernetes.io/hostname: vm5-k3s-ing-server
+service:
+  type: NodePort
+yamlApplicationConfig:
+  kafka:
+    clusters:
+    - bootstrapServers: kafka.kafka.svc.cluster.local:9092
+      name: ytsaurus-lab
+EOF
+```
+
+### helm kafka
+
+```bash
+helm install kafka oci://registry-1.docker.io/bitnamicharts/kafka \
+  --version 32.4.3 \
+  --namespace kafka \
+  --create-namespace \
+  -f ~/helm-values/kafka.yaml
+
+# Смотреть pods
+kubectl get pods -n kafka -w
+# Ctrl+C когда controller и broker Running
+```
+
+### kafka UI
+
+```bash
+helm install kafka-ui kafbat-ui/kafka-ui \
+  --namespace kafka \
+  --version 1.6.4 \
+  -f ~/helm-values/kafka-ui.yaml
+
+kubectl get pods -n kafka -w
+```
 
