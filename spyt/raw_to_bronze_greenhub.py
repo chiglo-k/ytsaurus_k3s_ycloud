@@ -52,7 +52,9 @@ def random_uuid():
 
 
 def read_yt_table(spark: SparkSession, path: str):
-    return spark.read.format("yt").load(yt_table_path(path))
+    # Read YTsaurus tables by raw Cypress path.
+    # For this SPYT datasource, read works with //home/... while write uses ytTable:/home/...
+    return spark.read.format("yt").load(path)
 
 
 def to_bool(col_name: str):
