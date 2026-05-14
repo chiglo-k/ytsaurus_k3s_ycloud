@@ -13,6 +13,7 @@ from pyspark.sql.window import Window
 
 BRONZE_ROOT = "//home/bronze_stage/greenhub"
 SILVER_PATH = "//home/silver_stage/greenhub_telemetry"
+COUNTRY_REF_PATH = "//home/ref/iso_dim"
 
 
 def yt_table_path(path: str) -> str:
@@ -71,6 +72,7 @@ def main() -> int:
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--bronze-root", default=BRONZE_ROOT)
     parser.add_argument("--silver-path", default=SILVER_PATH)
+    parser.add_argument("--country-ref-path", default=COUNTRY_REF_PATH)
     parser.add_argument(
         "--incremental-overlap-hours",
         type=int,
@@ -88,6 +90,7 @@ def main() -> int:
     print(f"[INFO] batch_id    = {args.batch_id}", flush=True)
     print(f"[INFO] bronze root = {args.bronze_root}", flush=True)
     print(f"[INFO] silver path = {args.silver_path}", flush=True)
+    print(f"[INFO] country ref = {args.country_ref_path}", flush=True)
     print(f"[INFO] bronze fact = {f'{args.bronze_root}/fact_telemetry'}", flush=True)
     print(f"[INFO] silver out  = {yt_table_path(args.silver_path)}", flush=True)
     print(f"[INFO] overlap h   = {args.incremental_overlap_hours}", flush=True)
@@ -242,6 +245,28 @@ def main() -> int:
         .withColumn("_bronze_loaded_at", F.col("_loaded_at"))
     )
 
+
+    country_ref = (
+        read_yt(spark, args.country_ref_path)
+        .select(
+            F.upper(F.trim(F.col("country_code").cast("string"))).alias("_ref_country_code"),
+            F.col("country_name").cast("string").alias("country_name"),
+            F.col("alpha3_code").cast("string").alias("country_alpha3_code"),
+            F.col("region").cast("string").alias("country_region"),
+            F.col("sub_region").cast("string").alias("country_sub_region"),
+        )
+        .where(F.col("_ref_country_code").isNotNull())
+        .dropDuplicates(["_ref_country_code"])
+    )
+
+    silver = (
+        silver
+        .withColumn("country_code", F.upper(F.trim(F.col("country_code").cast("string"))))
+        .join(F.broadcast(country_ref), F.col("country_code") == F.col("_ref_country_code"), "left")
+        .drop("_ref_country_code")
+        .withColumn("country_name", F.coalesce(F.col("country_name"), F.col("country_code")))
+    )
+
     silver_out = silver.select(
         "fact_uid",
         "source_id",
@@ -250,6 +275,10 @@ def main() -> int:
         "event_ts_str",
         "event_date",
         "country_code",
+        "country_name",
+        "country_alpha3_code",
+        "country_region",
+        "country_sub_region",
         "timezone_name",
         "battery_state",
         "network_status",

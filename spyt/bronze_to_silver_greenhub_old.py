@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import timedelta
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -15,36 +16,67 @@ SILVER_PATH = "//home/silver_stage/greenhub_telemetry"
 
 
 def yt_table_path(path: str) -> str:
+    """Write path for SPYT/YTsaurus datasource.
+
+    In this environment writes work with ytTable:/home/... while reads work
+    more reliably with raw Cypress paths like //home/...
+    """
     if path.startswith("ytTable:"):
         return path
-
-    if path.startswith("//"):
-        return "ytTable:/" + path
-
-    if path.startswith("/"):
-        return "ytTable:///" + path.lstrip("/")
-
-    return "ytTable:///" + path
+    return "ytTable:" + path.removeprefix("/")
 
 
 def read_yt(spark: SparkSession, path: str):
-    return spark.read.format("yt").load(yt_table_path(path))
-
-
+    """Read by raw Cypress path, for example //home/silver_stage/greenhub_telemetry."""
+    return spark.read.format("yt").load(path)
 
 
 def try_read_yt(spark: SparkSession, path: str):
     try:
         return read_yt(spark, path)
     except Exception as exc:
-        print(f"[WARN] cannot read existing YT table {path}: {exc!r}; treating as empty", flush=True)
+        msg = repr(exc)
+        missing_markers = (
+            "does not exist",
+            "No such",
+            "ResolveError",
+            "has no child",
+            "cannot find",
+            "Cannot find",
+        )
+        if any(marker in msg for marker in missing_markers):
+            print(f"[INFO] YT table {path} does not exist; treating as empty", flush=True)
+            return None
+        raise RuntimeError(f"Cannot read YT table {path}: {exc!r}") from exc
+
+
+def max_silver_bronze_loaded_at(existing_silver):
+    if existing_silver is None or "_bronze_loaded_at" not in existing_silver.columns:
         return None
+
+    row = (
+        existing_silver
+        .select(
+            F.max(
+                F.to_timestamp(F.col("_bronze_loaded_at"), "yyyy-MM-dd HH:mm:ss")
+            ).alias("max_loaded_at")
+        )
+        .collect()[0]
+    )
+    return row["max_loaded_at"]
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--bronze-root", default=BRONZE_ROOT)
     parser.add_argument("--silver-path", default=SILVER_PATH)
+    parser.add_argument(
+        "--incremental-overlap-hours",
+        type=int,
+        default=2,
+        help="Safety overlap window when filtering bronze by _loaded_at from existing silver.",
+    )
     args = parser.parse_args()
 
     spark = (
@@ -56,12 +88,34 @@ def main() -> int:
     print(f"[INFO] batch_id    = {args.batch_id}", flush=True)
     print(f"[INFO] bronze root = {args.bronze_root}", flush=True)
     print(f"[INFO] silver path = {args.silver_path}", flush=True)
-    print(f"[INFO] bronze fact = {yt_table_path(f'{args.bronze_root}/fact_telemetry')}", flush=True)
+    print(f"[INFO] bronze fact = {f'{args.bronze_root}/fact_telemetry'}", flush=True)
     print(f"[INFO] silver out  = {yt_table_path(args.silver_path)}", flush=True)
+    print(f"[INFO] overlap h   = {args.incremental_overlap_hours}", flush=True)
+
+    existing_silver = try_read_yt(spark, args.silver_path)
+    max_loaded_at = max_silver_bronze_loaded_at(existing_silver)
 
     fact = read_yt(spark, f"{args.bronze_root}/fact_telemetry")
+    fact_count_total = fact.count()
+    print(f"[INFO] bronze fact rows total: {fact_count_total:,}", flush=True)
+
+    if max_loaded_at is not None:
+        cutoff = max_loaded_at - timedelta(hours=args.incremental_overlap_hours)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        print(
+            f"[INFO] silver max _bronze_loaded_at={max_loaded_at}; "
+            f"bronze cutoff with overlap={cutoff_str}",
+            flush=True,
+        )
+        fact = fact.where(
+            F.to_timestamp(F.col("_loaded_at"), "yyyy-MM-dd HH:mm:ss")
+            >= F.to_timestamp(F.lit(cutoff_str), "yyyy-MM-dd HH:mm:ss")
+        )
+    else:
+        print("[INFO] no silver watermark found; scanning all bronze fact rows", flush=True)
+
     fact_count_in = fact.count()
-    print(f"[INFO] bronze fact rows: {fact_count_in:,}", flush=True)
+    print(f"[INFO] bronze fact rows selected: {fact_count_in:,}", flush=True)
 
     w = Window.partitionBy("fact_uid").orderBy(F.col("_loaded_at").desc())
     fact_dedup = (
@@ -73,25 +127,43 @@ def main() -> int:
     fact_count_dedup = fact_dedup.count()
     print(
         f"[INFO] after dedup:      {fact_count_dedup:,} "
-        f"(removed {fact_count_in - fact_count_dedup:,} dupes)",
+        f"(removed {fact_count_in - fact_count_dedup:,} dupes from selected window)",
         flush=True,
     )
 
-    existing_silver = try_read_yt(spark, args.silver_path)
     if existing_silver is not None:
-        existing_silver_keys = existing_silver.select("fact_uid").dropDuplicates(["fact_uid"])
+        existing_silver_keys = (
+            existing_silver
+            .select("fact_uid")
+            .where(F.col("fact_uid").isNotNull())
+            .dropDuplicates(["fact_uid"])
+            .cache()
+        )
         existing_silver_count = existing_silver_keys.count()
         fact_new = fact_dedup.join(existing_silver_keys, on="fact_uid", how="left_anti")
     else:
         existing_silver_count = 0
         fact_new = fact_dedup
 
+    fact_new = fact_new.cache()
     fact_new_count = fact_new.count()
     print(
         f"[INFO] silver append candidates: {fact_new_count:,} "
         f"(existing silver fact_uid={existing_silver_count:,})",
         flush=True,
     )
+
+    if fact_new_count == 0:
+        print(f"[INFO] no new silver rows to append -> {yt_table_path(args.silver_path)}", flush=True)
+        print(f"[DONE] batch_id        : {args.batch_id}", flush=True)
+        print(f"[DONE] bronze fact in  : {fact_count_in:,}", flush=True)
+        print(f"[DONE] after dedup     : {fact_count_dedup:,}", flush=True)
+        print(f"[DONE] silver out      : 0", flush=True)
+        fact_new.unpersist()
+        if existing_silver is not None:
+            existing_silver_keys.unpersist()
+        spark.stop()
+        return 0
 
     def read_dim(name: str, value_col_alias: str):
         return (
@@ -247,6 +319,9 @@ def main() -> int:
     print(f"[DONE] after dedup     : {fact_count_dedup:,}", flush=True)
     print(f"[DONE] silver out      : {silver_count:,}", flush=True)
 
+    fact_new.unpersist()
+    if existing_silver is not None:
+        existing_silver_keys.unpersist()
     spark.stop()
     return 0
 
