@@ -526,3 +526,159 @@ helm install kafka-ui kafbat-ui/kafka-ui \
 kubectl get pods -n kafka -w
 ```
 
+## Airflow
+
+```yaml
+cat > ~/helm-values/airflow.yaml <<'EOF'
+# === Node placement ===
+# Airflow целиком на vm5 (как было)
+apiServer:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+  service:
+    type: NodePort
+createUserJob:
+  defaultUser:
+    email: chiglok.tech@gmail.com
+    enabled: true
+    firstName: Askold
+    lastName: Apet
+    password: Tye1lf0f3sdcXX
+    role: Admin
+    username: AFL938ahZKal
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+dagProcessor:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+migrateDatabaseJob:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+postgresql:
+  primary:
+    nodeSelector:
+      kubernetes.io/hostname: vm5-k3s-ing-server
+    persistence:
+      size: 5Gi   # ограничиваем чтобы не разрасся
+redis:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+scheduler:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+statsd:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+triggerer:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+webserver:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+  service:
+    type: NodePort
+workers:
+  nodeSelector:
+    kubernetes.io/hostname: vm5-k3s-ing-server
+
+# === DAGs from GitHub ===
+dags:
+  gitSync:
+    branch: main
+    credentialsSecret: airflow-git-credentials
+    enabled: true
+    period: 30s
+    repo: https://github.com/chiglo-k/ytsaurus_k3s_ycloud.git
+    subPath: dags
+  persistence:
+    enabled: false
+EOF
+```
+
+### helm Airflow
+
+Если репозиторий закрыт
+----------------------------
+```bash
+kubectl create namespace airflow
+
+kubectl create secret generic airflow-git-credentials \
+  -n airflow \
+  --from-literal=GIT_SYNC_USERNAME='GH_USER' \
+  --from-literal=GIT_SYNC_PASSWORD='GH_PAT'
+```
+-----------------------------
+
+
+```bash
+helm repo add apache-airflow https://airflow.apache.org/
+helm repo update
+
+helm install airflow apache-airflow/airflow \
+  --namespace airflow \
+  --version 1.20.0 \
+  -f ~/helm-values/airflow.yaml
+
+sleep 500
+kubectl get pods -n airflow -w
+```
+
+## SPYT
+
+```bash
+source /home/chig_k3s/yt-env/bin/activate
+pip install ytsaurus-spyt
+
+#проверка! вне ytsaurus поэтому прям его надо отлавливать
+ls /home/chig_k3s/yt-env/bin/ | grep -E "spark|spyt"
+which spark-launch-yt
+which spark-submit-yt
+```
+Отдельно JAVA/PySpark
+
+```bash
+sudo apt-get install -y openjdk-17-jdk-headless
+java -version
+ls -la /usr/lib/jvm/ | grep -E "java-17"
+```
+```bash
+source /home/chig_k3s/yt-env/bin/activate
+pip install "pyspark>=3.5,<4.0"
+
+python -c "import pyspark; print(pyspark.__version__)"
+```
+
+Поднимаем SPYT release в Cypress
+
+```
+yt create map_node //home/spark --ignore-existing
+yt create map_node //home/spark/discovery --ignore-existing
+```
+
+#### PATCH
+
+Exec nodes //
+
+```bash
+kubectl patch ytsaurus minisaurus -n default --type='json' -p='[
+  {"op": "replace", "path": "/spec/execNodes/0/resources/requests/cpu", "value": "24"},
+  {"op": "replace", "path": "/spec/execNodes/0/resources/requests/memory", "value": "96Gi"},
+  {"op": "replace", "path": "/spec/execNodes/0/resources/limits/cpu", "value": "24"},
+  {"op": "replace", "path": "/spec/execNodes/0/resources/limits/memory", "value": "96Gi"}
+]'
+```
+
+Запуск кластера
+
+```bash
+spark-launch-yt \
+  --proxy localhost:31103 \
+  --pool research \
+  --discovery-path //home/spark/discovery/main \
+  --worker-cores 2 \
+  --worker-num 2 \
+  --worker-memory 3G \
+  --tmpfs-limit 1G \
+  --params '{spark_conf={"spark.driver.host"="10.130.0.24"}}'
+```
+
