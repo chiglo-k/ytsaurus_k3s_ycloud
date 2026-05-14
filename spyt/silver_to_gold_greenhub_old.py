@@ -16,15 +16,17 @@ GOLD_ROOT = "//home/gold_stage"
 
 
 def yt_table_path(path: str) -> str:
-    """Write path for SPYT YTsaurus datasource."""
     if path.startswith("ytTable:"):
         return path
-    return "ytTable:" + path.removeprefix("/")
+    if path.startswith("//"):
+        return "ytTable:/" + path
+    if path.startswith("/"):
+        return "ytTable:///" + path.lstrip("/")
+    return "ytTable:///" + path
 
 
 def read_yt(spark: SparkSession, path: str) -> DataFrame:
-    """Read YTsaurus tables by raw Cypress path."""
-    return spark.read.format("yt").load(path)
+    return spark.read.format("yt").load(yt_table_path(path))
 
 
 def write_yt_append(df: DataFrame, path: str) -> None:
@@ -32,12 +34,9 @@ def write_yt_append(df: DataFrame, path: str) -> None:
 
 
 def mart_daily_country_stats(silver: DataFrame) -> DataFrame:
-    if "country_name" not in silver.columns:
-        silver = silver.withColumn("country_name", F.col("country_code"))
-
     return (
         silver
-        .groupBy(F.col("date_local"), F.col("country_code"), F.col("country_name"))
+        .groupBy(F.col("date_local"), F.col("country_code"))
         .agg(
             F.count("*").alias("n_events"),
             F.countDistinct("device_id").alias("n_devices"),
@@ -184,7 +183,6 @@ def cast_to_ddl(mart: str, df: DataFrame, batch_id: str) -> DataFrame:
         return df.select(
             F.col("date_local").cast("string"),
             F.col("country_code").cast("string"),
-            F.col("country_name").cast("string"),
             F.col("n_events").cast("long"),
             F.col("n_devices").cast("long"),
             F.col("avg_battery_level").cast("double"),
