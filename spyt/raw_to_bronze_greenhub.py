@@ -14,7 +14,7 @@ NULL_SENTINEL = "__null__"
 
 
 def yt_table_path(path: str) -> str:
-    return "ytTable:" + path.removeprefix("/")
+    return "ytTable:" + path
 
 
 def norm_raw_col(col_name: str):
