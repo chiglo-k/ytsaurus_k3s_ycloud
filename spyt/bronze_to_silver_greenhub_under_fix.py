@@ -145,6 +145,21 @@ def main() -> int:
         .dropDuplicates(["_join_device_uid"])
     )
 
+    silver = (
+        fact_new
+        .join(dim_device, F.col("device_uid") == F.col("_join_device_uid"), "left").drop("_join_device_uid")
+        .join(dim_country, F.col("country_uid") == F.col("_join_country_uid"), "left").drop("_join_country_uid")
+        .join(dim_timezone, F.col("timezone_uid") == F.col("_join_timezone_uid"), "left").drop("_join_timezone_uid")
+        .join(dim_battery_state, F.col("battery_state_uid") == F.col("_join_battery_state_uid"), "left").drop("_join_battery_state_uid")
+        .join(dim_network_status, F.col("network_status_uid") == F.col("_join_network_status_uid"), "left").drop("_join_network_status_uid")
+        .join(dim_charger, F.col("charger_uid") == F.col("_join_charger_uid"), "left").drop("_join_charger_uid")
+        .join(dim_health, F.col("health_uid") == F.col("_join_health_uid"), "left").drop("_join_health_uid")
+        .join(dim_network_type, F.col("network_type_uid") == F.col("_join_network_type_uid"), "left").drop("_join_network_type_uid")
+        .join(dim_mobile_network_type, F.col("mobile_network_type_uid") == F.col("_join_mobile_network_type_uid"), "left").drop("_join_mobile_network_type_uid")
+        .join(dim_mobile_data_status, F.col("mobile_data_status_uid") == F.col("_join_mobile_data_status_uid"), "left").drop("_join_mobile_data_status_uid")
+        .join(dim_mobile_data_activity, F.col("mobile_data_activity_uid") == F.col("_join_mobile_data_activity_uid"), "left").drop("_join_mobile_data_activity_uid")
+        .join(dim_wifi_status, F.col("wifi_status_uid") == F.col("_join_wifi_status_uid"), "left").drop("_join_wifi_status_uid")
+    )
 
 
     def build_and_write_silver_for_fact_new(fact_new, chunk_label: str) -> int:
