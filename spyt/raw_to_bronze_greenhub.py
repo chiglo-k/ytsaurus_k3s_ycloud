@@ -73,8 +73,6 @@ def append_simple_dim_only_new(
     raw_col: str,
 ) -> int:
     """
-    Ensure dim rows exist by natural key raw_value.
-
     If raw_value already exists in the dimension table, skip it.
     If raw_value is new, assign a random UUID and append one new row.
     """
@@ -126,7 +124,6 @@ def append_simple_dim_only_new(
 
 
 def append_device_dim_only_new(df_raw, spark: SparkSession, path: str) -> int:
-    """Ensure device dimension rows exist by natural key device_id."""
     df_candidate = (
         df_raw
         .select(F.col("device_id").cast("long").alias("device_id"), "event_ts_str")

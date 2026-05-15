@@ -16,7 +16,7 @@ from airflow.providers.ssh.hooks.ssh import SSHHook
 
 try:
     from airflow.operators.python import get_current_context
-except ImportError:  # pragma: no cover
+except ImportError: 
     def get_current_context() -> dict:
         return {}
 from botocore.exceptions import ClientError
