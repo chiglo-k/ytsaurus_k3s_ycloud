@@ -32,6 +32,10 @@ def read_yt(spark: SparkSession, path: str):
     return spark.read.format("yt").load(path)
 
 
+def write_yt_append(df, path: str) -> None:
+    df.write.format("yt").mode("append").save(yt_table_path(path))
+
+
 def try_read_yt(spark: SparkSession, path: str):
     try:
         return read_yt(spark, path)
@@ -67,6 +71,11 @@ def max_silver_bronze_loaded_at(existing_silver):
     return row["max_loaded_at"]
 
 
+def chunks(values: list[str], batch_size: int) -> list[list[str]]:
+    batch_size = max(int(batch_size), 1)
+    return [values[i:i + batch_size] for i in range(0, len(values), batch_size)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-id", required=True)
@@ -96,6 +105,10 @@ def main() -> int:
     print(f"[INFO] bronze fact = {f'{args.bronze_root}/fact_telemetry'}", flush=True)
     print(f"[INFO] silver out  = {yt_table_path(args.silver_path)}", flush=True)
     print(f"[INFO] overlap h   = {args.incremental_overlap_hours}", flush=True)
+
+    fact = read_yt(spark, f"{args.bronze_root}/fact_telemetry")
+    fact_count_in = fact.count()
+    print(f"[INFO] bronze fact rows total: {fact_count_in:,}", flush=True)
 
     existing_silver = try_read_yt(spark, args.silver_path)
 
@@ -145,7 +158,39 @@ def main() -> int:
         .dropDuplicates(["_join_device_uid"])
     )
 
+    country_ref = (
+        read_yt(spark, args.country_ref_path)
+        .select(
+            F.upper(F.trim(F.col("country_code").cast("string"))).alias("_ref_country_code"),
+            F.col("country_name").cast("string").alias("country_name"),
+            F.col("alpha3_code").cast("string").alias("country_alpha3_code"),
+            F.col("region").cast("string").alias("country_region"),
+            F.col("sub_region").cast("string").alias("country_sub_region"),
+        )
+        .where(F.col("_ref_country_code").isNotNull())
+        .dropDuplicates(["_ref_country_code"])
+    )
 
+    def anti_join_existing(fact_frame):
+        if existing_silver_keys is not None:
+            return fact_frame.join(F.broadcast(existing_silver_keys), on="fact_uid", how="left_anti")
+        return fact_frame
+
+    def dedup_fact_frame(fact_frame, selected_count: int, label: str):
+        w = Window.partitionBy("fact_uid").orderBy(F.col("_loaded_at").desc())
+        fact_dedup = (
+            fact_frame
+            .withColumn("_rn", F.row_number().over(w))
+            .where(F.col("_rn") == 1)
+            .drop("_rn")
+        )
+        dedup_count = fact_dedup.count()
+        print(
+            f"[INFO] {label} after dedup: {dedup_count:,} "
+            f"(removed {selected_count - dedup_count:,} dupes)",
+            flush=True,
+        )
+        return fact_dedup, dedup_count
 
     def build_and_write_silver_for_fact_new(fact_new, chunk_label: str) -> int:
         if fact_new is None:
@@ -158,6 +203,22 @@ def main() -> int:
         if fact_new_count == 0:
             fact_new.unpersist()
             return 0
+
+        silver = (
+            fact_new
+            .join(dim_device, F.col("device_uid") == F.col("_join_device_uid"), "left").drop("_join_device_uid")
+            .join(dim_country, F.col("country_uid") == F.col("_join_country_uid"), "left").drop("_join_country_uid")
+            .join(dim_timezone, F.col("timezone_uid") == F.col("_join_timezone_uid"), "left").drop("_join_timezone_uid")
+            .join(dim_battery_state, F.col("battery_state_uid") == F.col("_join_battery_state_uid"), "left").drop("_join_battery_state_uid")
+            .join(dim_network_status, F.col("network_status_uid") == F.col("_join_network_status_uid"), "left").drop("_join_network_status_uid")
+            .join(dim_charger, F.col("charger_uid") == F.col("_join_charger_uid"), "left").drop("_join_charger_uid")
+            .join(dim_health, F.col("health_uid") == F.col("_join_health_uid"), "left").drop("_join_health_uid")
+            .join(dim_network_type, F.col("network_type_uid") == F.col("_join_network_type_uid"), "left").drop("_join_network_type_uid")
+            .join(dim_mobile_network_type, F.col("mobile_network_type_uid") == F.col("_join_mobile_network_type_uid"), "left").drop("_join_mobile_network_type_uid")
+            .join(dim_mobile_data_status, F.col("mobile_data_status_uid") == F.col("_join_mobile_data_status_uid"), "left").drop("_join_mobile_data_status_uid")
+            .join(dim_mobile_data_activity, F.col("mobile_data_activity_uid") == F.col("_join_mobile_data_activity_uid"), "left").drop("_join_mobile_data_activity_uid")
+            .join(dim_wifi_status, F.col("wifi_status_uid") == F.col("_join_wifi_status_uid"), "left").drop("_join_wifi_status_uid")
+        )
 
         event_ts = F.to_timestamp(F.col("event_ts_str"), "yyyy-MM-dd HH:mm:ss")
 
@@ -187,20 +248,6 @@ def main() -> int:
             .withColumn("_silver_batch_id", F.lit(args.batch_id))
             .withColumn("_silver_built_at", F.date_format(F.current_timestamp(), "yyyy-MM-dd HH:mm:ss"))
             .withColumn("_bronze_loaded_at", F.col("_loaded_at"))
-        )
-
-
-        country_ref = (
-            read_yt(spark, args.country_ref_path)
-            .select(
-                F.upper(F.trim(F.col("country_code").cast("string"))).alias("_ref_country_code"),
-                F.col("country_name").cast("string").alias("country_name"),
-                F.col("alpha3_code").cast("string").alias("country_alpha3_code"),
-                F.col("region").cast("string").alias("country_region"),
-                F.col("sub_region").cast("string").alias("country_sub_region"),
-            )
-            .where(F.col("_ref_country_code").isNotNull())
-            .dropDuplicates(["_ref_country_code"])
         )
 
         silver = (
@@ -274,38 +321,16 @@ def main() -> int:
         )
 
         silver_count = silver_out.count()
-        print(f"[INFO] silver wide rows: {silver_count:,}", flush=True)
+        print(f"[INFO] {chunk_label} silver wide rows: {silver_count:,}", flush=True)
 
         if silver_count > 0:
-            print(f"[INFO] appending silver -> {yt_table_path(args.silver_path)}", flush=True)
+            print(f"[INFO] {chunk_label} appending silver -> {yt_table_path(args.silver_path)}", flush=True)
             write_yt_append(silver_out, args.silver_path)
         else:
-            print(f"[INFO] no new silver rows to append -> {yt_table_path(args.silver_path)}", flush=True)
-
+            print(f"[INFO] {chunk_label} no new silver rows to append -> {yt_table_path(args.silver_path)}", flush=True)
 
         fact_new.unpersist()
         return silver_count
-
-    def anti_join_existing(fact_frame):
-        if existing_silver_keys is not None:
-            return fact_frame.join(F.broadcast(existing_silver_keys), on="fact_uid", how="left_anti")
-        return fact_frame
-
-    def dedup_fact_frame(fact_frame, selected_count: int, label: str):
-        w = Window.partitionBy("fact_uid").orderBy(F.col("_loaded_at").desc())
-        fact_dedup = (
-            fact_frame
-            .withColumn("_rn", F.row_number().over(w))
-            .where(F.col("_rn") == 1)
-            .drop("_rn")
-        )
-        dedup_count = fact_dedup.count()
-        print(
-            f"[INFO] {label} after dedup: {dedup_count:,} "
-            f"(removed {selected_count - dedup_count:,} dupes)",
-            flush=True,
-        )
-        return fact_dedup, dedup_count
 
     total_silver_out = 0
     total_after_dedup = 0
@@ -326,6 +351,7 @@ def main() -> int:
             .where(F.col("_file_hash").isNotNull())
             .dropDuplicates(["_file_hash"])
         )
+
         if existing_silver is not None and "_file_hash" in existing_silver.columns:
             silver_files = (
                 existing_silver
@@ -337,23 +363,21 @@ def main() -> int:
         else:
             missing_files_df = bronze_files
 
-        missing_files = [r["_file_hash"] for r in missing_files_df.orderBy("_file_hash").collect()]
+        missing_files = [row["_file_hash"] for row in missing_files_df.orderBy("_file_hash").collect()]
         print(f"[INFO] missing bronze file_hash count: {len(missing_files):,}", flush=True)
 
         if not missing_files:
-            print("[INFO] no missing file_hash found; falling back to full anti-join scan", flush=True)
-            selected_count = fact_count_in
-            fact_dedup, dedup_count = dedup_fact_frame(fact, selected_count, "fallback full scan")
-            total_after_dedup += dedup_count
-            fact_new = anti_join_existing(fact_dedup)
-            total_silver_out += build_and_write_silver_for_fact_new(fact_new, "fallback full scan")
+            print("[INFO] no missing file_hash found; no catch-up chunks to process", flush=True)
         else:
-            batch_size = max(int(args.catchup_file_batch_size), 1)
-            chunks = [missing_files[i:i + batch_size] for i in range(0, len(missing_files), batch_size)]
-            print(f"[INFO] catch-up chunks: {len(chunks):,}; file_hash per chunk={batch_size}", flush=True)
+            file_chunks = chunks(missing_files, args.catchup_file_batch_size)
+            print(
+                f"[INFO] catch-up chunks: {len(file_chunks):,}; "
+                f"file_hash per chunk={max(int(args.catchup_file_batch_size), 1)}",
+                flush=True,
+            )
 
-            for idx, file_hashes in enumerate(chunks, start=1):
-                chunk_label = f"catch-up chunk {idx}/{len(chunks)}"
+            for idx, file_hashes in enumerate(file_chunks, start=1):
+                chunk_label = f"catch-up chunk {idx}/{len(file_chunks)}"
                 print(f"[INFO] {chunk_label}: file_hashes={file_hashes}", flush=True)
 
                 fact_chunk = fact.where(F.col("_file_hash").isin(file_hashes))
@@ -366,34 +390,30 @@ def main() -> int:
                 fact_new = anti_join_existing(fact_dedup)
                 total_silver_out += build_and_write_silver_for_fact_new(fact_new, chunk_label)
     else:
-        max_loaded = (
-            existing_silver
-            .select(F.max(F.to_timestamp("_bronze_loaded_at", "yyyy-MM-dd HH:mm:ss")).alias("max_loaded"))
-            .collect()[0]["max_loaded"]
-        )
+        max_loaded_at = max_silver_bronze_loaded_at(existing_silver)
 
-        if max_loaded is None:
-            print("[INFO] no silver watermark found; scanning all bronze fact rows", flush=True)
-            fact_selected = fact
-            fact_count_selected = fact_count_in
-        else:
-            from datetime import timedelta
-
-            overlap_hours = float(getattr(args, "overlap_hours", 2))
-            cutoff = max_loaded - timedelta(hours=overlap_hours)
+        if max_loaded_at is not None:
+            cutoff = max_loaded_at - timedelta(hours=args.incremental_overlap_hours)
+            cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
             print(
-                f"[INFO] silver max _bronze_loaded_at={max_loaded}; "
-                f"bronze cutoff with overlap={cutoff}",
+                f"[INFO] silver max _bronze_loaded_at={max_loaded_at}; "
+                f"bronze cutoff with overlap={cutoff_str}",
                 flush=True,
             )
             fact_selected = fact.where(
-                F.to_timestamp("_loaded_at", "yyyy-MM-dd HH:mm:ss") >= F.lit(cutoff)
+                F.to_timestamp(F.col("_loaded_at"), "yyyy-MM-dd HH:mm:ss")
+                >= F.to_timestamp(F.lit(cutoff_str), "yyyy-MM-dd HH:mm:ss")
             )
-            fact_count_selected = fact_selected.count()
+        else:
+            print("[INFO] no silver watermark found; scanning all bronze fact rows", flush=True)
+            fact_selected = fact
 
+        fact_count_selected = fact_selected.count()
         print(f"[INFO] bronze fact rows selected: {fact_count_selected:,}", flush=True)
+
         fact_dedup, dedup_count = dedup_fact_frame(fact_selected, fact_count_selected, "incremental window")
         total_after_dedup += dedup_count
+
         fact_new = anti_join_existing(fact_dedup)
         total_silver_out += build_and_write_silver_for_fact_new(fact_new, "incremental window")
 
