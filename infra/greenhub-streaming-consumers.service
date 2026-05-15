@@ -1,0 +1,25 @@
+[Unit]
+Description=GreenHub streaming consumers API->Kafka->Raw->Bronze
+After=network-online.target k3s.service spyt-cluster.service
+Wants=network-online.target
+Requires=k3s.service
+
+[Service]
+Type=simple
+User=chig_k3s
+Group=chig_k3s
+WorkingDirectory=/home/chig_k3s/git/repo/kafka
+Environment=YT_PROXY=http://localhost:31103
+Environment=YT_USE_HOSTS=0
+Environment=KAFKA_BOOTSTRAP_SERVERS=10.130.0.27:30092
+Environment=KAFKA_TOPIC=raw-events
+Environment=KAFKA_GROUP_ID=raw-consumer-fresh
+Environment=POLL_SECONDS=30
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/bin/start-streaming-consumers.sh
+ExecStop=/bin/bash -c 'for f in /home/chig_k3s/main_d/logs/*.pid; do kill $(cat $f) 2>/dev/null || true; done'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -27,7 +27,6 @@ def setup_yt_client():
 
 
 def get_consumer_offset(tablet_index: int) -> int:
-    """Читает текущий offset consumer'а для таблета через select-rows."""
     rows = list(yt.select_rows(
         f"[offset] from [{CONSUMER_PATH}] "
         f"where [queue_path] = '{RAW_TABLE}' and [partition_index] = {tablet_index}"
@@ -39,7 +38,6 @@ def get_consumer_offset(tablet_index: int) -> int:
 
 def process_tablet(tablet_index: int) -> int:
     bronze_table = TABLET_TO_BRONZE[tablet_index]
-
     offset = get_consumer_offset(tablet_index)
 
     rows = list(yt.pull_consumer(
@@ -49,14 +47,12 @@ def process_tablet(tablet_index: int) -> int:
         offset=offset,
         max_row_count=BATCH_SIZE,
     ))
-
     if not rows:
         return 0
 
     processed_at = utc_now()
     bronze_rows = []
     last_row_index = offset - 1
-
     for row in rows:
         ridx = row.get("$row_index")
         bronze_rows.append({
@@ -75,7 +71,7 @@ def process_tablet(tablet_index: int) -> int:
         if ridx is not None:
             last_row_index = max(last_row_index, ridx)
 
-    # bronze_t* — dynamic tables, нужен insert_rows (а не write_table)
+    # bronze_t* — dynamic tables → insert_rows (а не write_table)
     yt.insert_rows(bronze_table, bronze_rows, raw=False)
 
     new_offset = last_row_index + 1
@@ -86,13 +82,11 @@ def process_tablet(tablet_index: int) -> int:
         old_offset=offset,
         new_offset=new_offset,
     )
-
     return len(rows)
 
 
 def main():
     setup_yt_client()
-
     print("raw_to_bronze started")
     print(f"raw_table={RAW_TABLE}")
     print(f"consumer={CONSUMER_PATH}")
@@ -120,7 +114,6 @@ def main():
                 )
             else:
                 time.sleep(POLL_SLEEP_SEC)
-
     except KeyboardInterrupt:
         print("stopped by user")
 
