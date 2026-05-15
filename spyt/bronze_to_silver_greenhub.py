@@ -387,7 +387,10 @@ def main() -> int:
                 fact_dedup, dedup_count = dedup_fact_frame(fact_chunk, selected_count, chunk_label)
                 total_after_dedup += dedup_count
 
-                fact_new = anti_join_existing(fact_dedup)
+                # File-aware catch-up uses _file_hash lineage.
+                # If the file_hash is missing in silver, the whole file is new for silver.
+                # Avoid anti-join against 14M+ existing fact_uid rows here.
+                fact_new = fact_dedup
                 total_silver_out += build_and_write_silver_for_fact_new(fact_new, chunk_label)
     else:
         max_loaded_at = max_silver_bronze_loaded_at(existing_silver)
