@@ -288,17 +288,12 @@ def main() -> int:
             "_silver_built_at",
         )
 
-            silver_count = silver_out.count()
+        silver_count = silver_out.count()
         print(f"[INFO] silver wide rows: {silver_count:,}", flush=True)
 
         if silver_count > 0:
             print(f"[INFO] appending silver -> {yt_table_path(args.silver_path)}", flush=True)
-            (
-                silver_out.write
-                .format("yt")
-                .mode("append")
-                .save(yt_table_path(args.silver_path))
-            )
+            write_yt_append(silver_out, args.silver_path)
         else:
             print(f"[INFO] no new silver rows to append -> {yt_table_path(args.silver_path)}", flush=True)
 
