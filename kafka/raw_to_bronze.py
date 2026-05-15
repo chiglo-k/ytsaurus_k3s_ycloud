@@ -75,12 +75,8 @@ def process_tablet(tablet_index: int) -> int:
         if ridx is not None:
             last_row_index = max(last_row_index, ridx)
 
-    yt.write_table(
-        yt.TablePath(bronze_table, append=True),
-        bronze_rows,
-        format=yt.JsonFormat(attributes={"encode_utf8": False}),
-        raw=False,
-    )
+    # bronze_t* — dynamic tables, нужен insert_rows (а не write_table)
+    yt.insert_rows(bronze_table, bronze_rows, raw=False)
 
     new_offset = last_row_index + 1
     yt.advance_consumer(

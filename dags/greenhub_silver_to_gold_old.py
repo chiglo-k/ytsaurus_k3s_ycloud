@@ -34,9 +34,6 @@ LOADER_NAME = "spyt_silver_to_gold"
 
 MARTS = [
     "daily_country_stats",
-    "country_overview",
-    "device_lifecycle",
-    "hourly_battery_health",
 ]
 
 ROW_SILVER_RE = re.compile(r"\[DONE\]\s+silver in\s*:\s*([\d,]+)")
